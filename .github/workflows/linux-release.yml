@@ -93,6 +93,18 @@ jobs:
           npm test
           npm run build
 
+      - name: Setup Python for isolated SSH test fixtures
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install tagged SSH fixture dependencies
+        run: |
+          fixture_python_path="$RUNNER_TEMP/opspier-fixture-python"
+          python3 -m pip install --target "$fixture_python_path" -r app/tests/fixtures/requirements.txt
+          PYTHONPATH="$fixture_python_path" python3 -c 'import paramiko; print("SSH fixture Paramiko:", paramiko.__version__)'
+          echo "AIC_OPS_FIXTURE_PYTHON_PATH=$fixture_python_path" >> "$GITHUB_ENV"
+
       - name: Test Rust modules
         working-directory: app/src-tauri
         run: cargo test --locked

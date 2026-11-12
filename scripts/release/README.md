@@ -55,4 +55,6 @@ bash -n scripts/release/publish-linux.sh
 
 测试使用独立临时 Git 仓库、真实 `dpkg-deb` 测试包与 `sha256sum`，覆盖标签和源码版本绑定、缺包、重复包、架构、AppImage 文件头与校验和。实际应用构建还依赖标签中的两个锁文件、Rust stable、Node.js 24 和工作流声明的 Linux 开发库。Cargo 使用 `--locked`，不会为修复历史构建而自动升级依赖。
 
+Rust SSH 协议测试还会启动标签中的 Python SSH 夹具。工作流使用 Python 3.12，将该标签的 `tests/fixtures/requirements.txt` 安装到运行器临时目录，通过 `AIC_OPS_FIXTURE_PYTHON_PATH` 传给夹具；不会依赖系统预装 Paramiko，也不会跳过协议测试。缺少依赖时会在安装或导入检查阶段直接失败，避免只出现夹具启动 EOF。
+
 配置与 Actions 版本参照 [Tauri GitHub 发布指南](https://v2.tauri.app/distribute/pipelines/github/)、[tauri-action 配置](https://github.com/tauri-apps/tauri-action)及 [Linux 前置条件](https://v2.tauri.app/start/prerequisites/)。
