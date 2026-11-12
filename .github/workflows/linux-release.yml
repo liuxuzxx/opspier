@@ -1,0 +1,131 @@
+name: Linux release
+
+on:
+  push:
+    tags: ['v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to build (for example v0.1.8)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      # Retain these tools when checking out a historical application tag.
+      - name: Checkout release tooling from the workflow commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-tools
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Test release validation
+        run: node --test release-tools/tests/release_helpers.test.mjs
+
+      - name: Resolve existing release tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: node release-tools/scripts/release/linux-release.mjs resolve-tag release-tools "$RELEASE_TAG"
+
+      - name: Checkout exact tagged application source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          path: app
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag commit and application versions
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: node release-tools/scripts/release/linux-release.mjs validate-source app "$RELEASE_TAG" "$RELEASE_SHA"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential curl wget file libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2 libdbus-1-dev libsecret-1-dev xdg-utils
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          cache-on-failure: true
+
+      - name: Install frontend and standalone Tauri CLI
+        working-directory: app
+        run: |
+          npm ci
+          npm install --prefix "$RUNNER_TEMP/opspier-tauri-cli" --no-package-lock --no-save @tauri-apps/cli@2
+
+      - name: Test and build tagged frontend
+        working-directory: app
+        run: |
+          npm test
+          npm run build
+
+      - name: Test Rust modules
+        working-directory: app/src-tauri
+        run: cargo test --locked
+
+      # Build only here; incomplete bundles must never reach a Release.
+      - name: Build AppImage and Debian packages
+        uses: tauri-apps/tauri-action@v1
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        with:
+          projectPath: app
+          tauriScript: ${{ runner.temp }}/opspier-tauri-cli/node_modules/.bin/tauri
+          args: --config ${{ github.workspace }}/release-tools/scripts/release/tauri.linux-release.conf.json --bundles appimage,deb -- --locked
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+
+      - name: Validate source, bundles and checksums
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          node release-tools/scripts/release/linux-release.mjs validate-source app "$RELEASE_TAG" "$RELEASE_SHA"
+          node release-tools/scripts/release/linux-release.mjs collect-assets app/src-tauri/target/release/bundle release-assets "$RELEASE_VERSION"
+          cd release-assets
+          sha256sum -c SHA256SUMS-linux-x86_64.txt
+
+      - name: Publish packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          IS_BACKFILL: ${{ github.event_name == 'workflow_dispatch' }}
+        run: bash release-tools/scripts/release/publish-linux.sh
