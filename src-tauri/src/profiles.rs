@@ -58,6 +58,7 @@ pub enum ProfileSettings {
     Mysql(DatabaseSettings),
     Doris(DatabaseSettings),
     Kubernetes(KubeSettings),
+    Minio(crate::minio_service::MinioSettings),
 }
 impl ProfileSettings {
     pub fn driver(&self) -> &'static str {
@@ -66,6 +67,7 @@ impl ProfileSettings {
             Self::Mysql(_) => "mysql",
             Self::Doris(_) => "doris",
             Self::Kubernetes(_) => "kubernetes",
+            Self::Minio(_) => "minio",
         }
     }
     pub fn target(&self) -> String {
@@ -85,6 +87,9 @@ impl ProfileSettings {
                     .unwrap_or_default()
             }
             Self::Kubernetes(s) => format!("kubernetes:{}", s.snapshot_id),
+            Self::Minio(s) => {
+                serde_json::to_string(&("minio", &s.endpoint, &s.region)).unwrap_or_default()
+            }
         };
         digest(public_target.as_bytes())
     }
@@ -112,6 +117,7 @@ impl ProfileSettings {
                     && !s.database.chars().any(char::is_control)
                     && ["auto", "verifyIdentity", "required", "disabled"].contains(&s.tls.as_str())
             }
+            Self::Minio(s) => s.validate().is_ok(),
             Self::Kubernetes(s) => {
                 !s.contexts.is_empty()
                     && s.contexts.len() <= 200
@@ -461,6 +467,9 @@ impl ProfileStore {
             }
             CredentialChange::Remove => None,
             CredentialChange::Replace(material) => {
+                if matches!(&draft.settings, ProfileSettings::Minio(_)) {
+                    crate::minio_service::MinioMaterial::decode(&material)?;
+                }
                 if let ProfileSettings::Kubernetes(s) = &draft.settings {
                     if serde_json::from_slice::<KubeMaterial>(&material)
                         .map(|value| value.snapshot_id != s.snapshot_id)
@@ -601,7 +610,10 @@ impl ProfileStore {
         for profile in profiles {
             if !text_valid(&profile.name, 80)
                 || !text_valid(&profile.source_id, 256)
-                || matches!(&profile.settings, ProfileSettings::Kubernetes(_))
+                || matches!(
+                    &profile.settings,
+                    ProfileSettings::Kubernetes(_) | ProfileSettings::Minio(_)
+                )
             {
                 return Err("旧连接字段无效，原记录保留".into());
             }

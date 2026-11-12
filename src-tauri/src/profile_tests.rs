@@ -347,3 +347,110 @@ fn automatic_mysql_profiles_reopen_with_credentials_without_changing_legacy_poli
         panic!("legacy driver changed");
     }
 }
+
+#[test]
+fn minio_keys_stay_in_system_store_and_endpoint_edits_cannot_reuse_them() {
+    let (root, _, credentials, repo) = fixture();
+    let value = serde_json::json!({"driver":"minio","endpoint":"https://objects.example.test:9000","region":"us-east-1","bucket":""});
+    let config: ProfileSettings =
+        serde_json::from_value(value.clone()).expect("MinIO must be a supported profile");
+    let material = br#"{"accessKey":"synthetic-access-only","secretKey":"synthetic-secret-only"}"#;
+    let saved = repo
+        .save(
+            ProfileDraft {
+                id: None,
+                expected_revision: None,
+                name: "objects".into(),
+                settings: config,
+            },
+            CredentialChange::Replace(material.to_vec()),
+        )
+        .unwrap()
+        .profile
+        .unwrap();
+    let public = serde_json::to_string(&repo.list().unwrap()).unwrap();
+    let disk = std::fs::read_to_string(root.0.join("profiles.json")).unwrap();
+    for secret in ["synthetic-access-only", "synthetic-secret-only"] {
+        assert!(!public.contains(secret) && !disk.contains(secret));
+    }
+    let reloaded = ProfileStore::open(root.0.join("profiles.json"), credentials).unwrap();
+    assert!(
+        reloaded
+            .resolve(&saved.id, saved.revision)
+            .unwrap()
+            .secret
+            .unwrap()
+            == material
+    );
+    let mut next = value.clone();
+    next["bucket"] = "photos".into();
+    let changed = repo
+        .save(
+            ProfileDraft {
+                id: Some(saved.id.clone()),
+                expected_revision: Some(saved.revision),
+                name: "photos".into(),
+                settings: serde_json::from_value(next.clone()).unwrap(),
+            },
+            CredentialChange::Keep,
+        )
+        .unwrap()
+        .profile
+        .unwrap();
+    next["endpoint"] = "https://other.example.test:9000".into();
+    assert!(
+        repo.save(
+            ProfileDraft {
+                id: Some(changed.id),
+                expected_revision: Some(changed.revision),
+                name: "changed".into(),
+                settings: serde_json::from_value(next).unwrap()
+            },
+            CredentialChange::Keep
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn invalid_minio_endpoint_and_material_are_rejected_without_saving() {
+    let (_, _, _, repo) = fixture();
+    for endpoint in [
+        "ftp://objects.example.test",
+        "https://user:pass@objects.example.test",
+        "https://objects.example.test/path",
+        "https://objects.example.test?token=value",
+        "https://objects.example.test/#fragment",
+    ] {
+        if let Ok(settings) = serde_json::from_value::<ProfileSettings>(
+            serde_json::json!({"driver":"minio","endpoint":endpoint,"region":"us-east-1","bucket":""}),
+        ) {
+            assert!(
+                repo.save(
+                    ProfileDraft {
+                        id: None,
+                        expected_revision: None,
+                        name: "invalid".into(),
+                        settings
+                    },
+                    CredentialChange::Remove
+                )
+                .is_err()
+            );
+        }
+    }
+    let settings: ProfileSettings = serde_json::from_value(serde_json::json!({"driver":"minio","endpoint":"http://localhost:9000","region":"us-east-1","bucket":""})).expect("MinIO supported");
+    assert!(
+        repo.save(
+            ProfileDraft {
+                id: None,
+                expected_revision: None,
+                name: "invalid".into(),
+                settings
+            },
+            CredentialChange::Replace(b"not-a-key-pair".to_vec())
+        )
+        .is_err()
+    );
+    assert!(repo.list().unwrap().profiles.is_empty());
+}

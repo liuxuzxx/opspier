@@ -198,3 +198,30 @@ test('a new MySQL draft resolves the hidden automatic TLS value before testing',
  const settings=handler('../src/ConnectionDialog.tsx','settings',{driver:'mysql',profile:null,form:{getFieldValue:()=>undefined}});
  assert.equal(settings({host:'db.example.test',port:3306,username:'reader'}).tls,'auto');
 });
+
+test('collapsing a category leaves the other categories expanded and toggles independently',()=>{
+ let state:Record<string,boolean>={};
+ const toggle=handler('../src/ConnectionManager.tsx','toggleCategory',{setCollapsedCategories:(change:(v:Record<string,boolean>)=>Record<string,boolean>)=>state=change(state)});
+ toggle('数据库');assert.equal(state['数据库'],true);assert.equal(state['Kubernetes'],undefined);
+ toggle('主机与终端');assert.equal(state['数据库'],true);assert.equal(state['主机与终端'],true);
+ toggle('数据库');assert.equal(state['数据库'],false);assert.equal(state['主机与终端'],true);
+});
+
+test('MinIO page results cannot replace a newer bucket or directory selection',async()=>{
+ let complete!:(value:unknown)=>void;let shown:any=null;let busy=false;
+ const wanted={current:JSON.stringify(['photos','',''])};const generation={current:0};
+ const load=handler('../src/MinioPanel.tsx','loadPage',{session:{id:'runtime'},mounted:{current:true},loadGeneration:generation,wantedRef:wanted,minioScopeKey:(...parts:string[])=>JSON.stringify(parts),setLoading:(v:boolean)=>busy=v,setError:()=>{},setPage:(v:unknown)=>shown=v,invoke:()=>new Promise(resolve=>complete=resolve)});
+ const pending=load('photos','','');wanted.current=JSON.stringify(['documents','','']);complete({objects:[{key:'old.jpg'}],nextCursor:null});await pending;assert.equal(shown,null);
+ const current=load('documents','','');complete({objects:[{key:'current.txt'}],nextCursor:null});await current;assert.equal(shown.objects[0].key,'current.txt');assert.equal(busy,false);
+});
+test('MinIO save stores the complete key pair in credential input, clears it after success and never copies it into metadata',async()=>{
+ let sent:any;let cleared:any;let saved=false;
+ const values={name:'',endpoint:'http://localhost:9000',region:'us-east-1',bucket:'photos',accessKey:'synthetic-access',secretKey:'synthetic-secret'};
+ const bindings={form:{validateFields:async()=>values,setFieldsValue:(v:unknown)=>cleared=v},settings:(v:any)=>({driver:'minio',endpoint:v.endpoint,region:v.region,bucket:v.bucket}),profile:null,mode:'replace',saving:{current:false},mounted:{current:true},setBusy:()=>{},setError:()=>{},credentialTargetUnchanged,invoke:async(_command:string,args:unknown)=>{sent=args;return {profile:{id:'saved'},durabilityConfirmed:true,cleanupPending:0};},onSaved:()=>saved=true};
+ await handler('../src/MinioDialog.tsx','save',bindings)();assert.equal(saved,true);assert.equal(sent.credential.action,'replaceMinio');assert.equal(sent.credential.accessKey,'synthetic-access');assert.equal(sent.credential.secretKey,'synthetic-secret');assert.equal(JSON.stringify(sent.draft).includes('synthetic-'),false);assert.deepEqual(cleared,{accessKey:'',secretKey:''});
+});
+test('declining overwrite never starts an overwriting upload',async()=>{
+ const requests:any[]=[];
+ const upload=handler('../src/MinioPanel.tsx','uploadOne',{session:{id:'runtime'},uploadFileName:()=> 'report.txt',askOverwrite:async()=>false,invoke:async(_command:string,args:any)=>{requests.push(args);throw 'OBJECT_EXISTS';}});
+ assert.equal(await upload('/fixture/report.txt','photos','folder/'),null);assert.equal(requests.length,1);assert.equal(requests[0].overwrite,false);assert.equal(requests[0].prefix,'folder/');
+});

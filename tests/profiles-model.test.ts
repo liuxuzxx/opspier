@@ -32,3 +32,11 @@ test('legacy display names outside the backend byte limit are isolated without c
  const storage={getItem:(key:string)=>key==='aic-ops.connections.v1'?raw:null};const result=legacyProfiles(storage);
  assert.equal(result.profiles.length,1);assert.equal(result.profiles[0].name,'valid');assert.equal(result.invalidCount,2);assert.equal(storage.getItem('aic-ops.connections.v1'),raw);
 });
+
+test('MinIO stays in object storage and saved keys are bound to endpoint and signing region',()=>{
+ const before={driver:'minio',endpoint:'https://objects.example.test:9000',region:'us-east-1',bucket:''};
+ assert.equal(categoryFor('minio'),'对象存储');
+ assert.equal(credentialTargetUnchanged(before,{...before,bucket:'photos'}),true);
+ assert.equal(credentialTargetUnchanged(before,{...before,endpoint:'https://other.example.test:9000'}),false);
+ assert.equal(credentialTargetUnchanged(before,{...before,region:'eu-west-1'}),false);
+});

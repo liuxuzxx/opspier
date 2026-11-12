@@ -7,6 +7,7 @@ pub mod kube_import;
 #[cfg(test)]
 mod kube_import_tests;
 pub mod kubernetes;
+pub mod minio_service;
 #[cfg(test)]
 mod profile_tests;
 pub mod profiles;
@@ -28,6 +29,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(Arc::new(ssh::SshService::default()))
         .manage(db::DbService::default())
+        .manage(minio_service::MinioService::default())
         .manage(kubernetes::KubeRuntimes::default())
         .setup(|app| {
             let connections = connections::Connections::open(
@@ -49,6 +51,16 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connections::kube_test_connection,
             connections::profiles_list,
+            connections::profiles_test_minio,
+            connections::profiles_connect_minio,
+            minio_service::minio_buckets,
+            minio_service::minio_objects,
+            minio_service::transfer::minio_upload,
+            minio_service::transfer::minio_download,
+            minio_service::transfer::minio_transfer,
+            minio_service::transfer::minio_cancel_transfer,
+            minio_service::minio_delete,
+            minio_service::minio_close,
             connections::profiles_save,
             connections::profiles_remove,
             connections::profiles_retry_cleanup,

@@ -1,19 +1,21 @@
+export type MinioSettings = {driver:"minio";endpoint:string;region:string;bucket:string};
 export type DatabaseSettings = { driver:'mysql'|'doris'; host:string; port:number; username:string; database:string; tls:'auto'|'verifyIdentity'|'required'|'disabled' };
 export type SshSettings = { driver:'ssh'; host:string; port:number; username:string; authentication:'password'|'key'; privateKeyPath:string|null };
 export type KubeSettings = { driver:'kubernetes'; context:string|null; namespace:string|null; contexts:string[]; snapshotId:string };
-export type ProfileSettings = DatabaseSettings|SshSettings|KubeSettings;
+export type ProfileSettings = DatabaseSettings|SshSettings|KubeSettings|MinioSettings;
 export type Profile = { id:string; name:string; settings:ProfileSettings; revision:number; credentialSaved:boolean };
 export type ProfileListing = {profiles:Profile[];cleanupPending:number};
 export type MutationReceipt = {durabilityConfirmed:boolean;profile:Profile|null;cleanupPending:number};
 export type LegacyProfile = {sourceId:string;name:string;settings:DatabaseSettings|SshSettings};
 
 export function categoryFor(driver:string):string|undefined {
- return ({ssh:'主机与终端',mysql:'数据库',doris:'数据库',kubernetes:'Kubernetes'} as Record<string,string>)[driver];
+ return ({ssh:'主机与终端',mysql:'数据库',doris:'数据库',kubernetes:'Kubernetes',minio:'对象存储'} as Record<string,string>)[driver];
 }
 export function credentialTargetUnchanged(before:Record<string,unknown>,after:Record<string,unknown>):boolean {
  const target=(s:Record<string,unknown>):string|undefined=>{
   if(s.driver==='ssh')return JSON.stringify([s.driver,s.host,s.port,s.username,s.authentication,s.privateKeyPath]);
   if(s.driver==='mysql'||s.driver==='doris')return JSON.stringify([s.driver,s.host,s.port,s.username,s.tls]);
+  if(s.driver==='minio')return JSON.stringify([s.driver,s.endpoint,s.region]);
   if(s.driver==='kubernetes'&&typeof s.snapshotId==='string')return JSON.stringify([s.driver,s.snapshotId]);
  };
  const current=target(before);return current!==undefined&&current===target(after);

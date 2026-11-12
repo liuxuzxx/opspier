@@ -155,7 +155,12 @@ impl Connections {
     }
 }
 #[derive(Deserialize)]
-#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum CredentialInput {
     Keep,
     ReplacePassword {
@@ -164,6 +169,10 @@ pub enum CredentialInput {
     ImportKube {
         token: String,
         binding: DraftBinding,
+    },
+    ReplaceMinio {
+        access_key: String,
+        secret_key: String,
     },
     Remove,
 }
@@ -176,10 +185,27 @@ fn apply_save(
         CredentialInput::Keep => CredentialChange::Keep,
         CredentialInput::Remove => CredentialChange::Remove,
         CredentialInput::ReplacePassword { value } => {
-            if matches!(draft.settings, ProfileSettings::Kubernetes(_)) {
+            if matches!(
+                draft.settings,
+                ProfileSettings::Kubernetes(_) | ProfileSettings::Minio(_)
+            ) {
                 return Err("集群凭据必须通过导入保存".into());
             }
             CredentialChange::Replace(value.into_bytes())
+        }
+        CredentialInput::ReplaceMinio {
+            access_key,
+            secret_key,
+        } => {
+            if !matches!(draft.settings, ProfileSettings::Minio(_)) {
+                return Err("MinIO 密钥只适用于对象存储连接".into());
+            }
+            let material = crate::minio_service::MinioMaterial {
+                access_key,
+                secret_key,
+            };
+            material.validate()?;
+            CredentialChange::Replace(serde_json::to_vec(&material).map_err(|_| "密钥材料无效")?)
         }
         CredentialInput::ImportKube { token, binding } => {
             binding.validate(&state.store)?;
@@ -729,4 +755,122 @@ mod db_draft_test_tests {
                 == b"synthetic-only"
         );
     }
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum MinioTestCredential {
+    Keep,
+    ReplaceMinio {
+        access_key: String,
+        secret_key: String,
+    },
+    Remove,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MinioProfileTest {
+    id: Option<String>,
+    expected_revision: Option<u64>,
+    settings: ProfileSettings,
+    credential: MinioTestCredential,
+}
+fn prepare_minio_test(
+    store: &ProfileStore,
+    request: MinioProfileTest,
+) -> Result<
+    (
+        crate::minio_service::MinioSettings,
+        crate::minio_service::MinioMaterial,
+    ),
+    String,
+> {
+    request.settings.validate()?;
+    let ProfileSettings::Minio(settings) = &request.settings else {
+        return Err("连接类型不是 MinIO".into());
+    };
+    let saved = match (&request.id, request.expected_revision) {
+        (Some(id), Some(revision)) => Some(store.snapshot(id, revision)?),
+        (None, None) => None,
+        _ => return Err("编辑版本无效".into()),
+    };
+    if saved
+        .as_ref()
+        .is_some_and(|p| !matches!(p.settings, ProfileSettings::Minio(_)))
+    {
+        return Err("连接类型不是 MinIO".into());
+    }
+    let material = match request.credential {
+        MinioTestCredential::Keep => {
+            let saved = saved.ok_or("此连接没有保存的密钥")?;
+            if saved.settings.target() != request.settings.target() {
+                return Err("认证目标已变化，请选择替换密钥后测试".into());
+            }
+            crate::minio_service::MinioMaterial::decode(
+                &store
+                    .resolve(&saved.id, saved.revision)?
+                    .secret
+                    .ok_or("此连接没有保存的密钥")?,
+            )?
+        }
+        MinioTestCredential::ReplaceMinio {
+            access_key,
+            secret_key,
+        } => {
+            let material = crate::minio_service::MinioMaterial {
+                access_key,
+                secret_key,
+            };
+            material.validate()?;
+            material
+        }
+        MinioTestCredential::Remove => return Err("请提供 Access Key 和 Secret Key 后测试".into()),
+    };
+    Ok((settings.clone(), material))
+}
+#[tauri::command]
+pub async fn profiles_test_minio(
+    state: tauri::State<'_, Arc<Connections>>,
+    request: MinioProfileTest,
+) -> Result<(), String> {
+    let store = state.store.clone();
+    let saved = request.id.clone().zip(request.expected_revision);
+    let target = store.clone();
+    let (settings, material) =
+        tokio::task::spawn_blocking(move || prepare_minio_test(&target, request))
+            .await
+            .map_err(|_| "MinIO 测试凭据读取任务已停止")??;
+    crate::minio_service::test_connection(settings, material).await?;
+    if let Some((id, revision)) = saved {
+        store.snapshot(&id, revision)?;
+    }
+    Ok(())
+}
+#[tauri::command]
+pub async fn profiles_connect_minio(
+    state: tauri::State<'_, Arc<Connections>>,
+    service: tauri::State<'_, crate::minio_service::MinioService>,
+    id: String,
+    revision: u64,
+) -> Result<crate::minio_service::MinioSession, String> {
+    let resolved = resolve(&state, id.clone(), revision).await?;
+    let ProfileSettings::Minio(settings) = resolved.profile.settings else {
+        return Err("连接类型不是 MinIO".into());
+    };
+    let material = crate::minio_service::MinioMaterial::decode(
+        &resolved
+            .secret
+            .ok_or("此连接没有保存的密钥，请编辑后保存")?,
+    )?;
+    let session = service.connect(settings, material).await?;
+    if let Err(error) = state.store.snapshot(&id, revision) {
+        let _ = service.close(&session.id);
+        return Err(error);
+    }
+    Ok(session)
 }

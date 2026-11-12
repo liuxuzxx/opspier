@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpsPier 0.1.7 actual app/Secret Service persistence, UI and native entry checks.
+"""OpsPier 0.1.8 actual app/Secret Service persistence, UI and native entry checks.
 
 Only synthetic loopback services and a private DBus/HOME/X196 are used. Secrets
 are passed in memory/stdin and never serialized into evidence or exception text.
@@ -26,6 +26,7 @@ import time
 import traceback
 sys.path.insert(0,str(Path(__file__).parent))
 from desktop_driver import Driver,free_port,ELEMENT
+from minio_desktop import verify as verify_minio
 sys.path.insert(0,str(Path(__file__).parent/'fixtures'))
 from desktop_services import start,start_tls_mysql
 ROOT=Path(__file__).resolve().parents[1]
@@ -49,7 +50,7 @@ class StableDriver(Driver):
         raise AssertionError('read-only UI condition timed out')
 
 
-def inside(output,application,previous_application=None):
+def inside(output,application,previous_application=None,minio_only=False):
     private=Path(os.environ['HOME']);processes=[];logs=[];daemon=None;driver=None;driver_process=None;db=kube=tls_db=tls_linger=None
     report={'status':'running','scope':'actual release, private HOME/XDG/DBus/real GNOME keyring, loopback services','ui':[],'ipc':[],'measurements':{},'appRuns':[]}
     phase='startup';owned=[];login=secrets.token_hex(36).encode();password='db-'+secrets.token_hex(32);ssh_password='ssh-'+secrets.token_hex(32);token='kube-'+secrets.token_hex(32)
@@ -84,7 +85,7 @@ def inside(output,application,previous_application=None):
     def start_app(label):
         nonlocal driver
         active=previous_application if label=='A-save' and previous_application else application
-        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier','0.1.7')
+        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier','0.1.8')
         session=driver.call('POST','/session',{'capabilities':{'alwaysMatch':{'browserName':'wry','tauri:options':{'application':str(active)}}}});driver.sid=session['sessionId']
         driver.cmd('POST','/timeouts',{'script':30000,'implicit':0,'pageLoad':30000});driver.cmd('POST','/window/rect',{'width':1460,'height':1060,'x':220,'y':10})
         driver.text('从左侧新建或打开连接');driver.text(f'{brand} {version}')
@@ -148,8 +149,9 @@ def inside(output,application,previous_application=None):
             subprocess.run([XDOTOOL,'key','--clearmodifiers','ctrl+l'],check=True)
             subprocess.run([XDOTOOL,'type','--clearmodifiers',str(config_path)],check=True)
             subprocess.run([XDOTOOL,'key','Return'],check=True)
-            time.sleep(.3)
-            subprocess.run([XDOTOOL,'key','Return'],check=True)
+            time.sleep(.4)
+            if subprocess.run([XDOTOOL,'search','--all','--onlyvisible','--name','选择 kubeconfig 文件'],capture_output=True,text=True).stdout.strip():
+                subprocess.run([XDOTOOL,'key','Return'],check=True)
             driver.wait("return document.querySelector('input[aria-label=kubeconfig文件路径]')?.value===arguments[0]",str(config_path))
         elif mode=='drag':
             helper=subprocess.Popen(['/usr/bin/python3',str(ROOT/'tests/fixtures/drag_source.py')],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True);processes.append(helper)
@@ -217,6 +219,13 @@ def inside(output,application,previous_application=None):
         for _ in range(100):
             try:driver.call('GET','/status');break
             except (OSError,RuntimeError):time.sleep(.1)
+        if minio_only:
+            def restart_private_keyring():
+                nonlocal daemon
+                stop_keyring();daemon=start_keyring()
+            verify_minio(driver,private,processes,[],check,snapshot,new_profile,profile_action,open_profile,saved_modal_closed,start_app,stop_app,restart_private_keyring)
+            report['status']='passed'
+            return 0
         start_app('A-save');snapshot('01-home.png');check('categorized-sidebar-and-native-version')
         phase='sidebar-collapse'
         width=driver.js("return document.querySelector('.workspace-area').getBoundingClientRect().width")
@@ -549,6 +558,11 @@ def inside(output,application,previous_application=None):
         assert driver.js("return document.querySelectorAll('[role=tab][aria-selected]').length")>=6
         check('delete-saved-profile-does-not-close-running-workspace')
         stop_app();config_parent.chmod(0o500);start_app('D-migration-idempotence');driver.text('有 1 项旧连接未迁移');assert len(driver.ipc('profiles_list')['profiles'])==6;assert driver.js("return localStorage.getItem('aic-ops.connections.v1')===arguments[0]",legacy_raw);config_parent.chmod(0o700);stop_app();check('valid-legacy-migration-is-idempotent-on-next-restart-without-rewriting-old-values')
+        phase='minio-native'
+        def restart_private_keyring():
+            nonlocal daemon
+            stop_keyring();daemon=start_keyring()
+        verify_minio(driver,private,processes,needles,check,snapshot,new_profile,profile_action,open_profile,saved_modal_closed,start_app,stop_app,restart_private_keyring)
         # Original input files have been deleted. Scan all remaining ordinary profile/cache/log files,
         # including encrypted keyring files, for synthetic raw/base64 material.
         inspected=0;variants=needles+[base64.b64encode(secret) for secret in needles]
@@ -601,15 +615,15 @@ def inside(output,application,previous_application=None):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--inside',action='store_true');parser.add_argument('--previous-application',type=Path);parser.add_argument('--application',type=Path,default=Path(os.environ.get('CARGO_TARGET_DIR',str(CACHE/'target')))/'release/opspier');parser.add_argument('--output',type=Path,default=CACHE/'desktop-evidence');args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
-    if args.inside:return inside(args.output,args.application,args.previous_application)
+    parser=argparse.ArgumentParser();parser.add_argument('--inside',action='store_true');parser.add_argument('--minio-only',action='store_true');parser.add_argument('--previous-application',type=Path);parser.add_argument('--application',type=Path,default=Path(os.environ.get('CARGO_TARGET_DIR',str(CACHE/'target')))/'release/opspier');parser.add_argument('--output',type=Path,default=CACHE/'desktop-evidence');args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
+    if args.inside:return inside(args.output,args.application,args.previous_application,args.minio_only)
     with tempfile.TemporaryDirectory(prefix='ops-ui-') as directory:
         root=Path(directory)
         for part in ['config','data','cache','run','Downloads']:(root/part).mkdir(mode=0o700)
         (root/'config/user-dirs.dirs').write_text(f'XDG_DOWNLOAD_DIR="{root}/Downloads"\n')
-        env={key:os.environ[key] for key in ['PKG_CONFIG_SYSROOT_DIR','CARGO_TARGET_DIR','AIC_OPS_FIXTURE_PYTHON_PATH','OPSPIER_TEST_CACHE','OPSPIER_XDOTOOL','OPSPIER_XVFB','OPSPIER_TAURI_DRIVER','OPSPIER_WEBKIT_DRIVER'] if key in os.environ}
+        env={key:os.environ[key] for key in ['PKG_CONFIG_SYSROOT_DIR','CARGO_TARGET_DIR','AIC_OPS_FIXTURE_PYTHON_PATH','OPSPIER_TEST_CACHE','OPSPIER_XDOTOOL','OPSPIER_XVFB','OPSPIER_TAURI_DRIVER','OPSPIER_WEBKIT_DRIVER','OPSPIER_MINIO_SERVER'] if key in os.environ}
         env.update(PATH='/usr/local/bin:/usr/bin:/bin',HOME=directory,DISPLAY=':196',XDG_CONFIG_HOME=str(root/'config'),XDG_DATA_HOME=str(root/'data'),XDG_CACHE_HOME=str(root/'cache'),XDG_RUNTIME_DIR=str(root/'run'),LD_LIBRARY_PATH=os.environ.get('LD_LIBRARY_PATH',''),LANG='C.UTF-8',LC_ALL='C.UTF-8',TAURI_WEBVIEW_AUTOMATION='true',WEBKIT_DISABLE_COMPOSITING_MODE='1',GIO_USE_VFS='local',NO_PROXY='127.0.0.1,localhost')
-        run=subprocess.run(['dbus-run-session','--','/usr/bin/python3',str(Path(__file__).resolve()),'--inside','--application',str(args.application),'--output',str(args.output)]+(['--previous-application',str(args.previous_application)] if args.previous_application else []),env=env,timeout=600)
+        run=subprocess.run(['dbus-run-session','--','/usr/bin/python3',str(Path(__file__).resolve()),'--inside','--application',str(args.application),'--output',str(args.output)]+(['--previous-application',str(args.previous_application)] if args.previous_application else [])+(['--minio-only'] if args.minio_only else []),env=env,timeout=900)
         # Native chooser services must not leave a FUSE mount inside our disposable runtime.
         own_mount=root/'run/gvfs'
         if os.path.ismount(own_mount):

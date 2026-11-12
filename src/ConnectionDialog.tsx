@@ -11,8 +11,8 @@ export default function ConnectionDialog({profile,driver,onClose,onSaved}:{profi
  function invalidateTest(){testRevision.current++;setTestResult(null);}const [mode,setMode]=useState<'keep'|'replace'|'remove'>(profile?.credentialSaved?'keep':'replace');
  const [busy,setBusy]=useState(false);const [error,setError]=useState('');const saving=useRef(false);const mounted=useRef(true);
  const values=Form.useWatch([],form) as Values|undefined;
- useEffect(()=>{form.setFieldsValue({...initialConnectionValues(driver,profile&&profile.settings.driver!=='kubernetes'?profile.settings:null),name:profile?.name??'',password:''});return()=>{mounted.current=false;form.setFieldValue('password','');};},[]);
- function settings(value:Values):Exclude<ProfileSettings,{driver:'kubernetes'}>{
+ useEffect(()=>{form.setFieldsValue({...initialConnectionValues(driver,profile&&profile.settings.driver!=='kubernetes'&&profile.settings.driver!=='minio'?profile.settings:null),name:profile?.name??'',password:''});return()=>{mounted.current=false;form.setFieldValue('password','');};},[]);
+ function settings(value:Values):Exclude<ProfileSettings,{driver:'kubernetes'|'minio'}>{
   const common={host:value.host.trim(),port:value.port,username:value.username.trim()};
   return driver==='ssh'?{driver,...common,authentication:value.authentication,privateKeyPath:value.authentication==='key'?value.privateKeyPath:null}:{driver,...common,database:value.database??'',tls:value.tls??form.getFieldValue('tls')??(driver==='mysql'&&!profile?'auto':'verifyIdentity')};
  }
