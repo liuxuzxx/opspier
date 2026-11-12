@@ -1,0 +1,40 @@
+[package]
+name = "opspier"
+version = "0.1.5"
+edition = "2024"
+description = "SSH terminal and read-only database/Kubernetes workbench"
+license = "MIT"
+[workspace]
+[lib]
+name = "opspier"
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+keyring = { version = "=3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
+sha2 = "0.10"
+libc = "0.2"
+secrecy = "=0.8.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+http-body-util = "=0.1.5"
+uuid = { version = "1", features = ["v4"] }
+base64 = "=0.22.1"
+ssh2 = "=0.9.5"
+sqlx = { version = "=0.8.6", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls-ring-native-roots", "chrono"] }
+sqlparser = { version = "=0.60.0", features = ["visitor"] }
+kube = { version = "=0.95.0", default-features = false, features = ["client", "config", "rustls-tls"] }
+k8s-openapi = { version = "=0.23.0", default-features = false, features = ["v1_31"] }
+[dev-dependencies]
+axum = "0.8"
+[profile.release]
+debug = 0
+strip = "debuginfo"
+opt-level = 2
+codegen-units = 8

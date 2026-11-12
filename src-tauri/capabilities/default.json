@@ -1,0 +1,13 @@
+{
+  "identifier": "main",
+  "description": "Local workbench commands and explicit clipboard actions",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text",
+    "dialog:allow-open"
+  ]
+}

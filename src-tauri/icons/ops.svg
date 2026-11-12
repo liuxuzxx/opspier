@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>OpsPier</title>
+  <defs>
+    <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#152a45"/>
+      <stop offset="1" stop-color="#081626"/>
+    </linearGradient>
+    <linearGradient id="prompt" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#72c5ff"/>
+      <stop offset="1" stop-color="#4285ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#shell)"/>
+  <rect x="9" y="9" width="238" height="238" rx="53" fill="none" stroke="#294963" stroke-width="2"/>
+  <circle cx="48" cy="47" r="5" fill="#4ce0b3"/>
+  <circle cx="66" cy="47" r="5" fill="#4f7795"/>
+  <circle cx="84" cy="47" r="5" fill="#4f7795"/>
+  <path d="M56 84 89 113 56 142" fill="none" stroke="url(#prompt)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M116 142H174" fill="none" stroke="#4ce0b3" stroke-width="14" stroke-linecap="round"/>
+  <g fill="none" stroke="#f1f7ff" stroke-width="7" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="61" y="181" width="29" height="31" rx="8"/>
+    <path d="M112 212V181H131Q140 181 140 190Q140 199 131 199H112"/>
+    <path d="M193 181H173Q163 181 163 189Q163 196 173 196H182Q193 196 193 204Q193 212 182 212H163"/>
+  </g>
+</svg>
