@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpsPier 0.1.6 actual app/Secret Service persistence, UI and native entry checks.
+"""OpsPier 0.1.7 actual app/Secret Service persistence, UI and native entry checks.
 
 Only synthetic loopback services and a private DBus/HOME/X196 are used. Secrets
 are passed in memory/stdin and never serialized into evidence or exception text.
@@ -50,7 +50,7 @@ class StableDriver(Driver):
 
 
 def inside(output,application,previous_application=None):
-    private=Path(os.environ['HOME']);processes=[];logs=[];daemon=None;driver=None;driver_process=None;db=kube=tls_db=None
+    private=Path(os.environ['HOME']);processes=[];logs=[];daemon=None;driver=None;driver_process=None;db=kube=tls_db=tls_linger=None
     report={'status':'running','scope':'actual release, private HOME/XDG/DBus/real GNOME keyring, loopback services','ui':[],'ipc':[],'measurements':{},'appRuns':[]}
     phase='startup';owned=[];login=secrets.token_hex(36).encode();password='db-'+secrets.token_hex(32);ssh_password='ssh-'+secrets.token_hex(32);token='kube-'+secrets.token_hex(32)
     def check(name,layer='ui'):
@@ -84,7 +84,7 @@ def inside(output,application,previous_application=None):
     def start_app(label):
         nonlocal driver
         active=previous_application if label=='A-save' and previous_application else application
-        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier','0.1.6')
+        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier','0.1.7')
         session=driver.call('POST','/session',{'capabilities':{'alwaysMatch':{'browserName':'wry','tauri:options':{'application':str(active)}}}});driver.sid=session['sessionId']
         driver.cmd('POST','/timeouts',{'script':30000,'implicit':0,'pageLoad':30000});driver.cmd('POST','/window/rect',{'width':1460,'height':1060,'x':220,'y':10})
         driver.text('从左侧新建或打开连接');driver.text(f'{brand} {version}')
@@ -121,7 +121,6 @@ def inside(output,application,previous_application=None):
     def fill_connection(kind,name,secret):
         new_profile(kind)
         for field,value in {'name':name,'host':'localhost','port':ssh_info['port'] if kind=='SSH' else db.server_address[1],'username':'fixture-user','password':secret}.items():driver.fill('.ant-modal #'+field,value)
-        if kind=='MySQL':driver.select('.ant-modal #tls','关闭 TLS（明文，仅可信隔离网络）')
     def select_resource(text):
         selector='.workspace:not([hidden]) [aria-label=资源类型]'
         element=driver.element(selector)
@@ -219,6 +218,13 @@ def inside(output,application,previous_application=None):
             try:driver.call('GET','/status');break
             except (OSError,RuntimeError):time.sleep(.1)
         start_app('A-save');snapshot('01-home.png');check('categorized-sidebar-and-native-version')
+        phase='sidebar-collapse'
+        width=driver.js("return document.querySelector('.workspace-area').getBoundingClientRect().width")
+        driver.button('收起连接')
+        driver.wait("return !document.querySelector('.connection-sidebar').getClientRects().length && document.querySelector('.workspace-area').getBoundingClientRect().width>arguments[0]+200",width)
+        driver.button('展开连接')
+        driver.wait("return !!document.querySelector('.connection-sidebar').getClientRects().length")
+        check('connection-sidebar-collapse-and-expand-gives-space-to-workspace')
         phase='unsaved-draft-tests'
         stop_keyring()
         def test_result(success=True):
@@ -247,12 +253,7 @@ def inside(output,application,previous_application=None):
             new_profile(kind);assert driver.js("return document.querySelector('.ant-modal #port').value") == str(port_default)
             for field,value in {'host':'localhost','port':db.server_address[1],'username':'fixture-user','password':'wrong-test-only'}.items():driver.fill('.ant-modal #'+field,value)
             before_auth=db.auth_success+db.auth_rejected
-            if kind=='MySQL':
-                driver.button('测试连接');driver.text('服务端未启用TLS，与当前TLS策略不匹配');assert db.auth_success+db.auth_rejected==before_auth
-                assert driver.js("return document.querySelector('.ant-modal #tls').closest('.ant-select').textContent.includes('验证证书与主机名')")
-                driver.select('.ant-modal #tls','关闭 TLS（明文，仅可信隔离网络）')
-            else:
-                assert not driver.js("return !!document.querySelector('.ant-modal #tls')")
+            assert not driver.js("return !!document.querySelector('.ant-modal #tls')")
             driver.button('测试连接');test_result(False)
             driver.fill('.ant-modal #password',password);start_trace=len(db.trace);driver.button('测试连接');test_result()
             queries=db.trace[start_trace:];assert 'SELECT 1' in queries
@@ -260,9 +261,18 @@ def inside(output,application,previous_application=None):
             assert driver.js("return document.querySelector('.ant-modal #name').value===''");assert_unsaved();snapshot('09-draft-'+('doris' if kind=='Apache Doris' else 'mysql')+'-test.png');driver.button('取消');saved_modal_closed()
         check('unnamed-MySQL-Doris-drafts-verify-password-read-only-probe-default-ports-and-no-save')
         tls_db=start_tls_mysql(private/'tls-fixture',password)
-        driver.ipc('db_test_connection',{'config':{'name':'','host':'127.0.0.1','port':tls_db.server_address[1],'username':'fixture-user','password':password,'database':'','kind':'doris','tls':'verifyIdentity'}})
-        assert tls_db.tls_connections==1 and tls_db.auth_success==1
-        check('Doris-automatically-upgrades-to-real-TLS-without-user-policy-input')
+        for kind,policy in [('doris','verifyIdentity'),('mysql','auto')]:
+            driver.ipc('db_test_connection',{'config':{'name':'','host':'127.0.0.1','port':tls_db.server_address[1],'username':'fixture-user','password':password,'database':'','kind':kind,'tls':policy}})
+        assert tls_db.tls_connections==2 and tls_db.auth_success==2
+        check('MySQL-and-Doris-automatically-upgrade-to-real-TLS-without-user-policy-input')
+        phase='TLS-peer-slow-close'
+        tls_linger=start_tls_mysql(private/'tls-linger-fixture',password,shutdown_delay_seconds=3)
+        started=time.monotonic()
+        driver.ipc('db_test_connection',{'config':{'name':'','host':'127.0.0.1','port':tls_linger.server_address[1],'username':'fixture-user','password':password,'database':'','kind':'mysql','tls':'auto'}})
+        elapsed=time.monotonic()-started;report['measurements']['TLS_peer_slow_close_test_ms']=round(elapsed*1000)
+        assert elapsed<1.5,'completed read-only query must not wait for an idle TLS peer to close'
+        check('completed-MySQL-probe-does-not-wait-for-a-slow-TLS-peer-close')
+        phase='unsaved-draft-tests'
         new_profile('Kubernetes');driver.fill('input[aria-label=kubeconfig文件路径]',str(config_path));driver.button('测试连接');test_result();assert_unsaved()
         driver.fill('input[aria-label=kubeconfig文件路径]',str(config_path)+'-missing');driver.wait("return ![...document.querySelectorAll('[data-testid=connection-test-result]')].some(e=>e.getClientRects().length)")
         driver.fill('input[aria-label=kubeconfig文件路径]',str(config_path));driver.button('解析配置');driver.text('2 个 Context');driver.select('.ant-modal #context','second');driver.fill('.ant-modal #namespace','review');driver.button('测试连接');test_result();assert_unsaved()
@@ -317,6 +327,23 @@ def inside(output,application,previous_application=None):
         report['measurements']['fourPaneResize']=[{'pane':index+1,'before':[before[cid]['width'],before[cid]['height']],'after':[resized[cid]['width'],resized[cid]['height']]} for index,cid in enumerate(pane_connections)]
         snapshot('11-four-pane-input-resize.png');driver.cmd('POST','/window/rect',{'width':1460,'height':1060});time.sleep(.4)
         check('four-SSH-panes-each-keyboard-echo-and-server-PTY-resize-with-returned-size')
+        phase='sidebar-live-SSH'
+        before_fold={cid:next(e for e in reversed(ssh_events()) if e['event']=='resize' and e.get('connection')==cid) for cid in pane_connections}
+        auth_before=sum(e['event']=='authentication' and e.get('accepted',False) for e in ssh_events())
+        driver.js("window.__sidebarSshNodes=[...document.querySelectorAll('[data-testid=ssh-pane]')]")
+        width=driver.js("return document.querySelector('.workspace-area').getBoundingClientRect().width")
+        offset=len(ssh_events());driver.button('收起连接')
+        driver.wait("return !document.querySelector('.connection-sidebar').getClientRects().length&&document.querySelector('.workspace-area').getBoundingClientRect().width>arguments[0]+200",width)
+        deadline=time.monotonic()+8
+        while True:
+            expanded={e['connection']:e for e in ssh_events()[offset:] if e['event']=='resize' and e.get('connection') in pane_connections}
+            if len(expanded)==4 and all(expanded[cid]['width']>before_fold[cid]['width'] for cid in pane_connections):break
+            if time.monotonic()>deadline:raise AssertionError('sidebar collapse must resize every existing SSH PTY')
+            time.sleep(.1)
+        assert driver.js("return window.__sidebarSshNodes.every((e,i)=>e.isConnected&&e===document.querySelectorAll('[data-testid=ssh-pane]')[i])")
+        assert sum(e['event']=='authentication' and e.get('accepted',False) for e in ssh_events())==auth_before
+        driver.button('展开连接');driver.wait("return !!document.querySelector('.connection-sidebar').getClientRects().length")
+        check('sidebar-collapse-preserves-live-SSH-panes-and-resizes-existing-PTYs')
         snapshot('02-four-ssh-workspaces.png');profile_action('NFS服务','编辑');driver.fill('.ant-modal #name','SSH已保存');assert driver.js("return document.querySelector('.ant-modal input[type=password]')===null");driver.button('保存连接');saved_modal_closed()
         open_profile('SSH已保存',False);assert driver.js("return document.querySelectorAll('[data-testid=ssh-pane]').length") == 4
         check('SSH-saved-open-fingerprint-four-panes-and-rename-keeps-running-snapshot')
@@ -489,6 +516,11 @@ def inside(output,application,previous_application=None):
         reopen_all('app-restart');snapshot('07-app-restart-reopen.png')
         phase='daemon-restart'
         stop_app();stop_keyring();daemon=start_keyring();start_app('C-daemon-restart');driver.text('有 1 项旧连接未迁移');profile_row('旧版待补凭据');assert driver.js("return localStorage.getItem('aic-ops.connections.v1')===arguments[0]",legacy_raw);reopen_all('credential-daemon-restart');snapshot('08-daemon-restart-reopen.png')
+        driver.js("window.__sidebarWorkspaceNodes=[...document.querySelectorAll('.workspace')];window.__sidebarActiveTab=document.querySelector('[role=tab][aria-selected=true]')")
+        driver.button('收起连接');driver.wait("return !document.querySelector('.connection-sidebar').getClientRects().length")
+        assert driver.js("return window.__sidebarWorkspaceNodes.every((e,i)=>e.isConnected&&e===document.querySelectorAll('.workspace')[i])&&window.__sidebarActiveTab===document.querySelector('[role=tab][aria-selected=true]')")
+        driver.button('展开连接');driver.wait("return !!document.querySelector('.connection-sidebar').getClientRects().length")
+        check('sidebar-toggle-keeps-active-workspace-and-existing-query-pages')
         phase='metadata-security'
         listing=driver.ipc('profiles_list');assert len(listing['profiles'])==7
         assert sum(p['credentialSaved'] for p in listing['profiles'])==6
@@ -499,17 +531,19 @@ def inside(output,application,previous_application=None):
         profile=next(p for p in listing['profiles'] if p['name']=='MySQL已保存')
         changed=dict(profile['settings'],host='127.0.0.1')
         result=driver.cmd('POST','/execute/async',{'script':"const done=arguments[arguments.length-1];window.__TAURI_INTERNALS__.invoke('profiles_save',arguments[0]).then(()=>done({rejected:false}),()=>done({rejected:true}));",'args':[{'draft':{'id':profile['id'],'expectedRevision':profile['revision'],'name':profile['name'],'settings':changed},'credential':{'action':'keep'}}]});assert result['rejected'];check('target-change-cannot-keep-old-credential-through-real-IPC','ipc')
-        phase='minimal-Doris-save'
-        new_profile('Apache Doris')
-        for field,value in {'host':'localhost','port':db.server_address[1],'username':'fixture-user','password':password}.items():driver.fill('.ant-modal #'+field,value)
-        assert not driver.js("return !!document.querySelector('.ant-modal #tls')")
-        driver.button('保存连接');saved_modal_closed()
-        generated='localhost:'+str(db.server_address[1]);profile_row(generated)
-        saved=next(p for p in driver.ipc('profiles_list')['profiles'] if p['name']==generated)
-        assert saved['settings']['database']=='' and saved['credentialSaved']
-        profile_action(generated,'删除');driver.button('删除连接');driver.wait("return ![...document.querySelectorAll('.profile-name')].some(e=>e.textContent===arguments[0])",generated)
-        saved_modal_closed()
-        check('Doris-saves-without-name-database-or-TLS-input-and-keeps-password')
+        phase='minimal-database-save'
+        for kind,driver_kind in [('Apache Doris','doris'),('MySQL','mysql')]:
+            new_profile(kind)
+            for field,value in {'host':'localhost','port':db.server_address[1],'username':'fixture-user','password':password}.items():driver.fill('.ant-modal #'+field,value)
+            assert not driver.js("return !!document.querySelector('.ant-modal #tls')")
+            driver.button('保存连接');saved_modal_closed()
+            generated='localhost:'+str(db.server_address[1]);profile_row(generated)
+            saved=next(p for p in driver.ipc('profiles_list')['profiles'] if p['name']==generated)
+            assert saved['settings']['driver']==driver_kind and saved['settings']['database']=='' and saved['credentialSaved']
+            if driver_kind=='mysql':assert saved['settings']['tls']=='auto'
+            profile_action(generated,'删除');driver.button('删除连接');driver.wait("return ![...document.querySelectorAll('.profile-name')].some(e=>e.textContent===arguments[0])",generated)
+            saved_modal_closed()
+            check(driver_kind+'-saves-without-name-database-or-TLS-input-and-keeps-password')
         phase='delete'
         profile_action('拖入集群','删除');driver.button('删除连接');driver.wait("return ![...document.querySelectorAll('.profile-name')].some(e=>e.textContent==='拖入集群')")
         assert driver.js("return document.querySelectorAll('[role=tab][aria-selected]').length")>=6
@@ -557,7 +591,7 @@ def inside(output,application,previous_application=None):
                 try:os.killpg(process.pid,signal.SIGKILL)
                 except ProcessLookupError:pass
                 process.wait()
-        for service in [db,kube,tls_db]:
+        for service in [db,kube,tls_db,tls_linger]:
             if service:service.shutdown();service.server_close()
         for log in logs:log.close()
         report['measurements']['webdriverReadRetries']=driver.read_retries if driver else 0

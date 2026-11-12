@@ -35,6 +35,7 @@ pub enum DbKind {
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DbTls {
+    Auto,
     VerifyIdentity,
     Required,
     Disabled,
@@ -503,6 +504,7 @@ fn connect_options(config: &DbConfig) -> Result<MySqlConnectOptions, String> {
         MySqlSslMode::Preferred
     } else {
         match config.tls {
+            DbTls::Auto => MySqlSslMode::Preferred,
             DbTls::VerifyIdentity => MySqlSslMode::VerifyIdentity,
             DbTls::Required => MySqlSslMode::Required,
             DbTls::Disabled => MySqlSslMode::Disabled,
@@ -711,8 +713,8 @@ async fn read_result(
             })
             .collect();
     }
-    // Close the dedicated transport instead of draining a potentially huge result set.
-    let _ = connection.close_hard().await;
+    // Drop the dedicated transport: TLS shutdown can wait indefinitely for the peer.
+    drop(connection);
     Ok(())
 }
 pub async fn test_connection(mut config: DbConfig) -> Result<(), String> {
@@ -795,6 +797,9 @@ impl DbService {
         } else {
             notes.push(
                 match config.tls {
+                    DbTls::Auto => {
+                        "TLS 由程序按服务端能力自动协商；服务端未启用 TLS 时使用普通连接"
+                    }
                     DbTls::VerifyIdentity => "TLS：验证系统 CA 证书和主机名",
                     DbTls::Required => "TLS：强制加密但不验证证书身份",
                     DbTls::Disabled => "TLS 已关闭，数据通过明文 TCP 传输",
@@ -1339,6 +1344,22 @@ mod tests {
         )
     }
     #[tokio::test]
+    async fn mysql_auto_tls_connects_without_tls_with_or_without_default_database() {
+        let (config, trace, _, listener) = wire_fixture().await;
+        for database in ["demo", ""] {
+            let value = serde_json::json!({"name":"fixture","host":config.host,"port":config.port,"username":config.username,"password":config.password,"database":database,"kind":"mysql","tls":"auto"});
+            let config: DbConfig =
+                serde_json::from_value(value).expect("automatic MySQL transport must be accepted");
+            test_connection(config)
+                .await
+                .expect("automatic MySQL connects to the non-TLS peer");
+        }
+        let queries = trace.lock().unwrap();
+        assert!(queries.iter().any(|s| s == "START TRANSACTION READ ONLY"));
+        assert!(queries.iter().filter(|s| s.as_str() == "SELECT 1").count() >= 2);
+        listener.abort();
+    }
+    #[tokio::test]
     async fn doris_automatically_connects_to_a_non_tls_server_with_legacy_tls_settings() {
         let (mut config, trace, _, listener) = wire_fixture().await;
         config.kind = DbKind::Doris;
@@ -1391,12 +1412,20 @@ mod tests {
 
     #[tokio::test]
     async fn doris_uses_tls_when_advertised_and_never_retries_a_failed_upgrade_as_plaintext() {
+        assert_tls_upgrade_without_plaintext_retry(DbKind::Doris, DbTls::Disabled).await;
+    }
+    #[tokio::test]
+    async fn mysql_auto_tls_never_retries_a_failed_upgrade_as_plaintext() {
+        let tls: DbTls = serde_json::from_str("\"auto\"").expect("automatic TLS must be accepted");
+        assert_tls_upgrade_without_plaintext_retry(DbKind::Mysql, tls).await;
+    }
+    async fn assert_tls_upgrade_without_plaintext_retry(kind: DbKind, tls: DbTls) {
         let (mut config, _, _, unused) = wire_fixture().await;
         unused.abort();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.port = listener.local_addr().unwrap().port();
-        config.kind = DbKind::Doris;
-        config.tls = DbTls::Disabled; // A historical field must not disable automatic negotiation.
+        config.kind = kind;
+        config.tls = tls;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let capabilities: u32 = 1 | 4 | 8 | 512 | 2048 | 8192 | 32768 | (1 << 19);
@@ -1431,7 +1460,7 @@ mod tests {
         let (requested_tls, retried) = server.await.unwrap();
         assert!(
             requested_tls,
-            "Doris must negotiate TLS when the server advertises it"
+            "automatic transport must negotiate TLS when the server advertises it"
         );
         assert!(
             !retried,

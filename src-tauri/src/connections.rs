@@ -368,6 +368,7 @@ fn prepare_db_test(store: &ProfileStore, request: DbProfileTest) -> Result<DbCon
         _ => unreachable!(),
     };
     let tls = match settings.tls.as_str() {
+        "auto" => DbTls::Auto,
         "verifyIdentity" => DbTls::VerifyIdentity,
         "required" => DbTls::Required,
         "disabled" => DbTls::Disabled,
@@ -418,6 +419,7 @@ pub async fn profiles_connect_db(
         _ => unreachable!(),
     };
     let tls = match settings.tls.as_str() {
+        "auto" => DbTls::Auto,
         "verifyIdentity" => DbTls::VerifyIdentity,
         "required" => DbTls::Required,
         "disabled" => DbTls::Disabled,

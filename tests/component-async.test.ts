@@ -183,3 +183,18 @@ test('Doris hidden TLS input preserves saved credential binding while database r
   assert.equal(draft.tls,tls);assert.equal(draft.database,'');
  }
 });
+
+
+test('new MySQL saves endpoint credentials without requiring name, database or a TLS input',async()=>{
+ for(const database of ['', 'demo']){
+  let requested:Record<string,any>|undefined;
+  const bindings={saving:{current:false},setBusy:()=>{},setError:()=>{},form:{validateFields:async()=>({host:'db.example.test',port:3306,username:'reader',database,password:'synthetic-only'}),setFieldValue:()=>{}},driver:'mysql',mode:'replace',profile:null,mounted:{current:true},settings:(v:Record<string,any>)=>({driver:'mysql',host:v.host,port:v.port,username:v.username,database:v.database,tls:'auto'}),invoke:async(_command:string,args:Record<string,any>)=>{requested=args;return {profile:{}};},onSaved:()=>{}};
+  await handler('../src/ConnectionDialog.tsx','save',bindings)();
+  assert.equal(requested?.draft.name,'db.example.test:3306');assert.equal(requested?.draft.settings.database,database);assert.equal(requested?.draft.settings.tls,'auto');
+ }
+});
+
+test('a new MySQL draft resolves the hidden automatic TLS value before testing',()=>{
+ const settings=handler('../src/ConnectionDialog.tsx','settings',{driver:'mysql',profile:null,form:{getFieldValue:()=>undefined}});
+ assert.equal(settings({host:'db.example.test',port:3306,username:'reader'}).tls,'auto');
+});

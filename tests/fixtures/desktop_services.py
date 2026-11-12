@@ -92,6 +92,8 @@ class Mysql(socketserver.BaseRequestHandler):
                     self.read(); return
                 if sql.startswith("SET ") or sql in ("START TRANSACTION READ ONLY", "ROLLBACK", "COMMIT"):
                     self.packet(1, ok)
+                elif sql == "SELECT 1" and getattr(self.server,'single_probe_row',False):
+                    self.result(["value"],[["1"]])
                 elif "VERSION()" in sql:
                     self.result(["version"], [["8.0.36-desktop-fixture"]])
                 elif sql == "SHOW DATABASES":
@@ -206,7 +208,7 @@ def start(expected_password=None,expected_token=None):
 
 
 
-def start_tls_mysql(directory, password):
+def start_tls_mysql(directory, password, shutdown_delay_seconds=0):
     """Synthetic TLS MySQL peer; verifies the client really upgrades its transport."""
     import ssl
     import subprocess
@@ -215,6 +217,10 @@ def start_tls_mysql(directory, password):
     subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(key),'-out',str(cert),'-days','1','-subj','/CN=localhost'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(cert,key)
     class TlsMysql(Mysql):
+        def handle(self):
+            super().handle()
+            if shutdown_delay_seconds:
+                time.sleep(shutdown_delay_seconds)
         def packet(self, sequence, body):
             if sequence==0:
                 body=bytearray(body);offset=body.index(0,1)+1+4+8+1
@@ -232,6 +238,6 @@ def start_tls_mysql(directory, password):
                 self.tls_active=True;self.tls_auth_pending=True;self.server.tls_connections+=1
             return super().read()
     server=socketserver.ThreadingTCPServer(('127.0.0.1',0),TlsMysql)
-    server.daemon_threads=True;server.expected_password=password;server.auth_success=0;server.auth_rejected=0;server.trace=[];server.tls_connections=0
+    server.daemon_threads=True;server.expected_password=password;server.auth_success=0;server.auth_rejected=0;server.trace=[];server.tls_connections=0;server.single_probe_row=True
     threading.Thread(target=server.serve_forever,daemon=True).start()
     return server

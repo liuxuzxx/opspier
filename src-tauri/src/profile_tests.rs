@@ -310,3 +310,40 @@ fn already_imported_legacy_records_do_not_attempt_another_metadata_write() {
     std::fs::remove_dir(&path).unwrap();
     std::fs::rename(backup, path).unwrap();
 }
+
+#[test]
+fn automatic_mysql_profiles_reopen_with_credentials_without_changing_legacy_policy() {
+    let (root, _, credentials, repo) = fixture();
+    let legacy = repo
+        .save(
+            draft("legacy"),
+            CredentialChange::Replace(b"legacy-test".to_vec()),
+        )
+        .unwrap()
+        .profile
+        .unwrap();
+    let mut auto = draft("automatic");
+    if let ProfileSettings::Mysql(ref mut settings) = auto.settings {
+        settings.tls = "auto".into();
+    }
+    let saved = repo
+        .save(auto, CredentialChange::Replace(b"automatic-test".to_vec()))
+        .expect("auto profile should save")
+        .profile
+        .unwrap();
+    let reloaded = ProfileStore::open(root.0.join("profiles.json"), credentials).unwrap();
+    assert_eq!(
+        reloaded
+            .resolve(&saved.id, saved.revision)
+            .unwrap()
+            .secret
+            .unwrap(),
+        b"automatic-test"
+    );
+    let old = reloaded.resolve(&legacy.id, legacy.revision).unwrap();
+    if let ProfileSettings::Mysql(ref settings) = old.profile.settings {
+        assert_eq!(settings.tls, "verifyIdentity");
+    } else {
+        panic!("legacy driver changed");
+    }
+}

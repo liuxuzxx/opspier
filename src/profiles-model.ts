@@ -1,4 +1,4 @@
-export type DatabaseSettings = { driver:'mysql'|'doris'; host:string; port:number; username:string; database:string; tls:'verifyIdentity'|'required'|'disabled' };
+export type DatabaseSettings = { driver:'mysql'|'doris'; host:string; port:number; username:string; database:string; tls:'auto'|'verifyIdentity'|'required'|'disabled' };
 export type SshSettings = { driver:'ssh'; host:string; port:number; username:string; authentication:'password'|'key'; privateKeyPath:string|null };
 export type KubeSettings = { driver:'kubernetes'; context:string|null; namespace:string|null; contexts:string[]; snapshotId:string };
 export type ProfileSettings = DatabaseSettings|SshSettings|KubeSettings;
@@ -33,7 +33,7 @@ export function legacyProfiles(storage:Pick<Storage,'getItem'>):{profiles:Legacy
   profiles.push({sourceId:`ssh:${value.id}`,name:value.name,settings:{driver:'ssh',host:value.host,port:value.port,username:value.username,authentication:'password',privateKeyPath:null}});
  }
  for(const value of read('aic-ops.db.connections.v1')) {
-  if(!object(value,['name','host','port','username','database','kind','tls'])||!text(value.name,80)||!text(value.host,253)||!port(value.port)||!text(value.username)||(typeof value.database!=='string'||new TextEncoder().encode(value.database).length>128||/[\u0000-\u001f\u007f-\u009f]/u.test(value.database))||!['mysql','doris'].includes(String(value.kind))||!['verifyIdentity','required','disabled'].includes(String(value.tls))){invalidCount++;continue;}
+  if(!object(value,['name','host','port','username','database','kind','tls'])||!text(value.name,80)||!text(value.host,253)||!port(value.port)||!text(value.username)||(typeof value.database!=='string'||new TextEncoder().encode(value.database).length>128||/[\u0000-\u001f\u007f-\u009f]/u.test(value.database))||!['mysql','doris'].includes(String(value.kind))||!['auto','verifyIdentity','required','disabled'].includes(String(value.tls))){invalidCount++;continue;}
   profiles.push({sourceId:'db',name:value.name,settings:{driver:value.kind as 'mysql'|'doris',host:value.host,port:value.port,username:value.username,database:value.database,tls:value.tls as DatabaseSettings['tls']}});
  }
  return {profiles,invalidCount};

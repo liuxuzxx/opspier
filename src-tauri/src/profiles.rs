@@ -110,7 +110,7 @@ impl ProfileSettings {
                     && s.port > 0
                     && s.database.len() <= 128
                     && !s.database.chars().any(char::is_control)
-                    && ["verifyIdentity", "required", "disabled"].contains(&s.tls.as_str())
+                    && ["auto", "verifyIdentity", "required", "disabled"].contains(&s.tls.as_str())
             }
             Self::Kubernetes(s) => {
                 !s.contexts.is_empty()
