@@ -203,3 +203,35 @@ def start(expected_password=None,expected_token=None):
     for service in (db, kube):
         threading.Thread(target=service.serve_forever, daemon=True).start()
     return db, kube
+
+
+
+def start_tls_mysql(directory, password):
+    """Synthetic TLS MySQL peer; verifies the client really upgrades its transport."""
+    import ssl
+    import subprocess
+    directory.mkdir(mode=0o700)
+    key=directory/'fixture.key';cert=directory/'fixture.crt'
+    subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(key),'-out',str(cert),'-days','1','-subj','/CN=localhost'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(cert,key)
+    class TlsMysql(Mysql):
+        def packet(self, sequence, body):
+            if sequence==0:
+                body=bytearray(body);offset=body.index(0,1)+1+4+8+1
+                capabilities=int.from_bytes(body[offset:offset+2],'little')|2048
+                body[offset:offset+2]=capabilities.to_bytes(2,'little')
+            elif getattr(self,'tls_auth_pending',False):
+                sequence+=1;self.tls_auth_pending=False
+            super().packet(sequence,body)
+        def read(self):
+            if not getattr(self,'tls_active',False):
+                request=super().read()
+                if len(request)!=32 or not int.from_bytes(request[:4],'little')&2048:
+                    raise EOFError('expected TLS upgrade before authentication')
+                self.request=context.wrap_socket(self.request,server_side=True)
+                self.tls_active=True;self.tls_auth_pending=True;self.server.tls_connections+=1
+            return super().read()
+    server=socketserver.ThreadingTCPServer(('127.0.0.1',0),TlsMysql)
+    server.daemon_threads=True;server.expected_password=password;server.auth_success=0;server.auth_rejected=0;server.trace=[];server.tls_connections=0
+    threading.Thread(target=server.serve_forever,daemon=True).start()
+    return server

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpsPier 0.1.5 actual app/Secret Service persistence, UI and native entry checks.
+"""OpsPier 0.1.6 actual app/Secret Service persistence, UI and native entry checks.
 
 Only synthetic loopback services and a private DBus/HOME/X196 are used. Secrets
 are passed in memory/stdin and never serialized into evidence or exception text.
@@ -27,7 +27,7 @@ import traceback
 sys.path.insert(0,str(Path(__file__).parent))
 from desktop_driver import Driver,free_port,ELEMENT
 sys.path.insert(0,str(Path(__file__).parent/'fixtures'))
-from desktop_services import start
+from desktop_services import start,start_tls_mysql
 ROOT=Path(__file__).resolve().parents[1]
 CACHE=Path(os.environ.get('OPSPIER_TEST_CACHE',str(Path.home()/'.cache/opspier')))
 XDOTOOL=os.environ.get('OPSPIER_XDOTOOL','xdotool')
@@ -50,7 +50,7 @@ class StableDriver(Driver):
 
 
 def inside(output,application,previous_application=None):
-    private=Path(os.environ['HOME']);processes=[];logs=[];daemon=None;driver=None;driver_process=None;db=kube=None
+    private=Path(os.environ['HOME']);processes=[];logs=[];daemon=None;driver=None;driver_process=None;db=kube=tls_db=None
     report={'status':'running','scope':'actual release, private HOME/XDG/DBus/real GNOME keyring, loopback services','ui':[],'ipc':[],'measurements':{},'appRuns':[]}
     phase='startup';owned=[];login=secrets.token_hex(36).encode();password='db-'+secrets.token_hex(32);ssh_password='ssh-'+secrets.token_hex(32);token='kube-'+secrets.token_hex(32)
     def check(name,layer='ui'):
@@ -84,7 +84,7 @@ def inside(output,application,previous_application=None):
     def start_app(label):
         nonlocal driver
         active=previous_application if label=='A-save' and previous_application else application
-        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier','0.1.5')
+        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier','0.1.6')
         session=driver.call('POST','/session',{'capabilities':{'alwaysMatch':{'browserName':'wry','tauri:options':{'application':str(active)}}}});driver.sid=session['sessionId']
         driver.cmd('POST','/timeouts',{'script':30000,'implicit':0,'pageLoad':30000});driver.cmd('POST','/window/rect',{'width':1460,'height':1060,'x':220,'y':10})
         driver.text('从左侧新建或打开连接');driver.text(f'{brand} {version}')
@@ -121,7 +121,7 @@ def inside(output,application,previous_application=None):
     def fill_connection(kind,name,secret):
         new_profile(kind)
         for field,value in {'name':name,'host':'localhost','port':ssh_info['port'] if kind=='SSH' else db.server_address[1],'username':'fixture-user','password':secret}.items():driver.fill('.ant-modal #'+field,value)
-        if kind!='SSH':driver.select('.ant-modal #tls','关闭 TLS（明文，仅可信隔离网络）')
+        if kind=='MySQL':driver.select('.ant-modal #tls','关闭 TLS（明文，仅可信隔离网络）')
     def select_resource(text):
         selector='.workspace:not([hidden]) [aria-label=资源类型]'
         element=driver.element(selector)
@@ -247,14 +247,22 @@ def inside(output,application,previous_application=None):
             new_profile(kind);assert driver.js("return document.querySelector('.ant-modal #port').value") == str(port_default)
             for field,value in {'host':'localhost','port':db.server_address[1],'username':'fixture-user','password':'wrong-test-only'}.items():driver.fill('.ant-modal #'+field,value)
             before_auth=db.auth_success+db.auth_rejected
-            driver.button('测试连接');driver.text('服务端未启用TLS，与当前TLS策略不匹配');assert db.auth_success+db.auth_rejected==before_auth
-            assert driver.js("return document.querySelector('.ant-modal #tls').closest('.ant-select').textContent.includes('验证证书与主机名')")
-            driver.select('.ant-modal #tls','关闭 TLS（明文，仅可信隔离网络）');driver.button('测试连接');test_result(False)
+            if kind=='MySQL':
+                driver.button('测试连接');driver.text('服务端未启用TLS，与当前TLS策略不匹配');assert db.auth_success+db.auth_rejected==before_auth
+                assert driver.js("return document.querySelector('.ant-modal #tls').closest('.ant-select').textContent.includes('验证证书与主机名')")
+                driver.select('.ant-modal #tls','关闭 TLS（明文，仅可信隔离网络）')
+            else:
+                assert not driver.js("return !!document.querySelector('.ant-modal #tls')")
+            driver.button('测试连接');test_result(False)
             driver.fill('.ant-modal #password',password);start_trace=len(db.trace);driver.button('测试连接');test_result()
             queries=db.trace[start_trace:];assert 'SELECT 1' in queries
             if kind=='Apache Doris':assert not any(q=='START TRANSACTION READ ONLY' for q in queries)
             assert driver.js("return document.querySelector('.ant-modal #name').value===''");assert_unsaved();snapshot('09-draft-'+('doris' if kind=='Apache Doris' else 'mysql')+'-test.png');driver.button('取消');saved_modal_closed()
         check('unnamed-MySQL-Doris-drafts-verify-password-read-only-probe-default-ports-and-no-save')
+        tls_db=start_tls_mysql(private/'tls-fixture',password)
+        driver.ipc('db_test_connection',{'config':{'name':'','host':'127.0.0.1','port':tls_db.server_address[1],'username':'fixture-user','password':password,'database':'','kind':'doris','tls':'verifyIdentity'}})
+        assert tls_db.tls_connections==1 and tls_db.auth_success==1
+        check('Doris-automatically-upgrades-to-real-TLS-without-user-policy-input')
         new_profile('Kubernetes');driver.fill('input[aria-label=kubeconfig文件路径]',str(config_path));driver.button('测试连接');test_result();assert_unsaved()
         driver.fill('input[aria-label=kubeconfig文件路径]',str(config_path)+'-missing');driver.wait("return ![...document.querySelectorAll('[data-testid=connection-test-result]')].some(e=>e.getClientRects().length)")
         driver.fill('input[aria-label=kubeconfig文件路径]',str(config_path));driver.button('解析配置');driver.text('2 个 Context');driver.select('.ant-modal #context','second');driver.fill('.ant-modal #namespace','review');driver.button('测试连接');test_result();assert_unsaved()
@@ -491,6 +499,17 @@ def inside(output,application,previous_application=None):
         profile=next(p for p in listing['profiles'] if p['name']=='MySQL已保存')
         changed=dict(profile['settings'],host='127.0.0.1')
         result=driver.cmd('POST','/execute/async',{'script':"const done=arguments[arguments.length-1];window.__TAURI_INTERNALS__.invoke('profiles_save',arguments[0]).then(()=>done({rejected:false}),()=>done({rejected:true}));",'args':[{'draft':{'id':profile['id'],'expectedRevision':profile['revision'],'name':profile['name'],'settings':changed},'credential':{'action':'keep'}}]});assert result['rejected'];check('target-change-cannot-keep-old-credential-through-real-IPC','ipc')
+        phase='minimal-Doris-save'
+        new_profile('Apache Doris')
+        for field,value in {'host':'localhost','port':db.server_address[1],'username':'fixture-user','password':password}.items():driver.fill('.ant-modal #'+field,value)
+        assert not driver.js("return !!document.querySelector('.ant-modal #tls')")
+        driver.button('保存连接');saved_modal_closed()
+        generated='localhost:'+str(db.server_address[1]);profile_row(generated)
+        saved=next(p for p in driver.ipc('profiles_list')['profiles'] if p['name']==generated)
+        assert saved['settings']['database']=='' and saved['credentialSaved']
+        profile_action(generated,'删除');driver.button('删除连接');driver.wait("return ![...document.querySelectorAll('.profile-name')].some(e=>e.textContent===arguments[0])",generated)
+        saved_modal_closed()
+        check('Doris-saves-without-name-database-or-TLS-input-and-keeps-password')
         phase='delete'
         profile_action('拖入集群','删除');driver.button('删除连接');driver.wait("return ![...document.querySelectorAll('.profile-name')].some(e=>e.textContent==='拖入集群')")
         assert driver.js("return document.querySelectorAll('[role=tab][aria-selected]').length")>=6
@@ -538,7 +557,7 @@ def inside(output,application,previous_application=None):
                 try:os.killpg(process.pid,signal.SIGKILL)
                 except ProcessLookupError:pass
                 process.wait()
-        for service in [db,kube]:
+        for service in [db,kube,tls_db]:
             if service:service.shutdown();service.server_close()
         for log in logs:log.close()
         report['measurements']['webdriverReadRetries']=driver.read_retries if driver else 0

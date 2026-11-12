@@ -164,3 +164,22 @@ test('changing namespace leaves the displayed local search page untouched before
  const change=handler('../src/KubePanel.tsx','changeNamespace',{setNamespaceInput:()=>{},cursors:{current:['']},setLocalPage:(v:number)=>localPage=v,setPagingNotice:()=>{},setDesired:(update:(v:any)=>any)=>desired=update(desired)});
  change('denied');assert.equal(localPage,2);assert.equal(desired.namespace,'denied');assert.equal(desired.search,'row-');
 });
+
+
+test('Doris saves using only endpoint and credentials, with an optional database and generated name',async()=>{
+ for(const database of ['', 'demo']){
+  let requested:Record<string,any>|undefined;let saved=false;
+  const bindings={saving:{current:false},setBusy:()=>{},setError:()=>{},form:{validateFields:async()=>({name:'',host:'db.example.test',port:9030,username:'reader',database,password:'synthetic-only',tls:'verifyIdentity'}),setFieldValue:()=>{}},driver:'doris',mode:'replace',profile:null,mounted:{current:true},settings:(v:Record<string,any>)=>({driver:'doris',host:v.host,port:v.port,username:v.username,database:v.database,tls:v.tls}),invoke:async(command:string,args:Record<string,any>)=>{assert.equal(command,'profiles_save');requested=args;return {profile:{}};},onSaved:()=>{saved=true;}};
+  await handler('../src/ConnectionDialog.tsx','save',bindings)();
+  assert.equal(saved,true);assert.equal(requested?.draft.name,'db.example.test:9030');assert.equal(requested?.draft.settings.database,database);
+ }
+});
+
+
+test('Doris hidden TLS input preserves saved credential binding while database remains optional',()=>{
+ for(const tls of ['verifyIdentity','required','disabled']){
+  const settings=handler('../src/ConnectionDialog.tsx','settings',{driver:'doris',form:{getFieldValue:(field:string)=>field==='tls'?tls:undefined}});
+  const draft=settings({host:'db.example.test',port:9030,username:'reader'});
+  assert.equal(draft.tls,tls);assert.equal(draft.database,'');
+ }
+});

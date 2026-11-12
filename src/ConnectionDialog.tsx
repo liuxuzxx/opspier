@@ -14,7 +14,7 @@ export default function ConnectionDialog({profile,driver,onClose,onSaved}:{profi
  useEffect(()=>{form.setFieldsValue({...initialConnectionValues(driver,profile&&profile.settings.driver!=='kubernetes'?profile.settings:null),name:profile?.name??'',password:''});return()=>{mounted.current=false;form.setFieldValue('password','');};},[]);
  function settings(value:Values):Exclude<ProfileSettings,{driver:'kubernetes'}>{
   const common={host:value.host.trim(),port:value.port,username:value.username.trim()};
-  return driver==='ssh'?{driver,...common,authentication:value.authentication,privateKeyPath:value.authentication==='key'?value.privateKeyPath:null}:{driver,...common,database:value.database??'',tls:value.tls};
+  return driver==='ssh'?{driver,...common,authentication:value.authentication,privateKeyPath:value.authentication==='key'?value.privateKeyPath:null}:{driver,...common,database:value.database??'',tls:value.tls??form.getFieldValue('tls')??'verifyIdentity'};
  }
  const targetChanged=!!profile&&!!values?.host&&!credentialTargetUnchanged(profile.settings,settings(values));
  async function save(){
@@ -22,7 +22,8 @@ export default function ConnectionDialog({profile,driver,onClose,onSaved}:{profi
   try{
    const value=await form.validateFields();const next=settings(value);
    if(mode==='keep'&&profile&&!credentialTargetUnchanged(profile.settings,next))throw '认证目标已变化，请选择替换凭据。';
-   const receipt=await invoke<MutationReceipt>('profiles_save',{draft:{id:profile?.id??null,expectedRevision:profile?.revision??null,name:value.name.trim(),settings:next},credential:mode==='replace'?{action:'replacePassword',value:value.password??''}:{action:mode}});
+   const name=(value.name??'').trim()||(driver==='doris'?`${next.host}:${next.port}`.slice(0,80):'');
+   const receipt=await invoke<MutationReceipt>('profiles_save',{draft:{id:profile?.id??null,expectedRevision:profile?.revision??null,name,settings:next},credential:mode==='replace'?{action:'replacePassword',value:value.password??''}:{action:mode}});
    form.setFieldValue('password','');if(mounted.current)onSaved(receipt);
   }catch(e){if(mounted.current&&!(e&&typeof e==='object'&&'errorFields'in e))setError(String(e));}
   finally{saving.current=false;if(mounted.current)setBusy(false);}
@@ -30,7 +31,7 @@ export default function ConnectionDialog({profile,driver,onClose,onSaved}:{profi
  async function testConnection(){
   if((profile&&driver==='ssh')||saving.current)return;saving.current=true;setBusy(true);setTesting(true);setTestResult(null);const revision=testRevision.current;
   try{
-   const fields=driver==='ssh'?['host','port','username','authentication','password',...(form.getFieldValue('authentication')==='key'?['privateKeyPath']:[])]:['host','port','username','password','database','tls'];
+   const fields=driver==='ssh'?['host','port','username','authentication','password',...(form.getFieldValue('authentication')==='key'?['privateKeyPath']:[])]:['host','port','username','password','database',...(driver==='mysql'?['tls']:[])];
    const value=await form.validateFields(fields);if(!mounted.current||revision!==testRevision.current)return;
    const next=settings(value);
    if(profile&&next.driver!=='ssh'){
@@ -55,10 +56,10 @@ export default function ConnectionDialog({profile,driver,onClose,onSaved}:{profi
  {modalHolder}{testResult&&<Typography.Paragraph data-testid="connection-test-result" type={testResult.kind==='error'?'danger':testResult.kind==='success'?'success':'secondary'} style={{marginBottom:8}}>{testResult.text}</Typography.Paragraph>}
  {error&&<Alert type="error" title={error} style={{marginBottom:16}}/>}
  <Form form={form} layout="vertical" disabled={busy} onValuesChange={invalidateTest}>
- <Form.Item name="name" label="连接名称" rules={[{required:true,whitespace:true,max:80}]}><Input autoFocus autoComplete="off"/></Form.Item>
+ <Form.Item name="name" label={driver==='doris'?'连接名称（可选）':'连接名称'} rules={[{required:driver!=='doris',whitespace:true,max:80}]}><Input autoFocus autoComplete="off" placeholder={driver==='doris'?'留空按主机和端口命名':undefined}/></Form.Item>
  <Space align="start"><Form.Item name="host" label="主机" rules={[{required:true,max:253}]}><Input placeholder="域名或 IP" autoComplete="off"/></Form.Item><Form.Item name="port" label="端口" rules={[{required:true}]}><InputNumber min={1} max={65535}/></Form.Item></Space>
  <Form.Item name="username" label={driver==='ssh'?'用户名':'只读用户名'} rules={[{required:true,max:128}]}><Input autoComplete="off"/></Form.Item>
- {driver==='ssh'?<><Form.Item name="authentication" label="认证方式"><Select options={[{value:'password',label:'密码'},{value:'key',label:'本机私钥文件'}]}/></Form.Item>{values?.authentication==='key'&&<Form.Item name="privateKeyPath" label="本机私钥绝对路径" rules={[{required:true}]}><Input autoComplete="off" placeholder="/absolute/path/to/key"/></Form.Item>}</>:<><Form.Item name="database" label="默认数据库（可选）"><Input maxLength={128}/></Form.Item><Form.Item name="tls" label="TLS 策略"><Select options={[{value:'verifyIdentity',label:'验证证书与主机名（系统 CA）'},{value:'required',label:'强制加密，不验证证书身份'},{value:'disabled',label:'关闭 TLS（明文，仅可信隔离网络）'}]}/></Form.Item></>}
+ {driver==='ssh'?<><Form.Item name="authentication" label="认证方式"><Select options={[{value:'password',label:'密码'},{value:'key',label:'本机私钥文件'}]}/></Form.Item>{values?.authentication==='key'&&<Form.Item name="privateKeyPath" label="本机私钥绝对路径" rules={[{required:true}]}><Input autoComplete="off" placeholder="/absolute/path/to/key"/></Form.Item>}</>:<><Form.Item name="database" label="默认数据库（可选）"><Input maxLength={128}/></Form.Item>{driver==='mysql'&&<Form.Item name="tls" label="TLS 策略"><Select options={[{value:'verifyIdentity',label:'验证证书与主机名（系统 CA）'},{value:'required',label:'强制加密，不验证证书身份'},{value:'disabled',label:'关闭 TLS（明文，仅可信隔离网络）'}]}/></Form.Item>}</>}
  {profile&&<Form.Item label="保存的凭据"><Select aria-label="保存的凭据" value={mode} onChange={value=>{invalidateTest();form.setFieldValue('password','');setMode(value);}} options={[...(profile?.credentialSaved?[{value:'keep',label:'保留已保存凭据'}]:[]),{value:'replace',label:profile?.credentialSaved?'替换凭据':'保存新凭据'},...(profile?.credentialSaved?[{value:'remove',label:'移除已保存凭据'}]:[])]}/></Form.Item>}
  {mode==='keep'&&targetChanged&&<Alert type="warning" title="认证目标已变化，请选择替换凭据。"/>}
  {mode==='replace'&&<Form.Item name="password" label={driver==='ssh'&&values?.authentication==='key'?'私钥口令（未加密可留空）':'密码（空密码可留空）'}><Input.Password autoComplete="new-password"/></Form.Item>}

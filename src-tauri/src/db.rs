@@ -498,10 +498,15 @@ fn connect_options(config: &DbConfig) -> Result<MySqlConnectOptions, String> {
     {
         return Err("连接参数无效".into());
     }
-    let ssl = match config.tls {
-        DbTls::VerifyIdentity => MySqlSslMode::VerifyIdentity,
-        DbTls::Required => MySqlSslMode::Required,
-        DbTls::Disabled => MySqlSslMode::Disabled,
+    let ssl = if config.kind == DbKind::Doris {
+        // Retain the historical field for credential binding; Doris negotiates transport.
+        MySqlSslMode::Preferred
+    } else {
+        match config.tls {
+            DbTls::VerifyIdentity => MySqlSslMode::VerifyIdentity,
+            DbTls::Required => MySqlSslMode::Required,
+            DbTls::Disabled => MySqlSslMode::Disabled,
+        }
     };
     let mut options = MySqlConnectOptions::new()
         .host(&config.host)
@@ -512,6 +517,10 @@ fn connect_options(config: &DbConfig) -> Result<MySqlConnectOptions, String> {
         .charset("utf8mb4")
         .statement_cache_capacity(0)
         .disable_statement_logging();
+    if config.kind == DbKind::Doris {
+        // SQLx otherwise uses a sql_mode subquery which Doris rejects during initialization.
+        options = options.pipes_as_concat(false).no_engine_substitution(false);
+    }
     if !config.database.is_empty() {
         options = options.database(&config.database);
     }
@@ -781,14 +790,18 @@ impl DbService {
         } else {
             "Doris：独立只读语法守卫；不发送 MySQL 事务/管理命令；不支持的扩展语法默认拒绝".into()
         }];
-        notes.push(
-            match config.tls {
-                DbTls::VerifyIdentity => "TLS：验证系统 CA 证书和主机名",
-                DbTls::Required => "TLS：强制加密但不验证证书身份",
-                DbTls::Disabled => "TLS 已关闭，数据通过明文 TCP 传输",
-            }
-            .into(),
-        );
+        if kind == DbKind::Doris {
+            notes.push("TLS 由程序按服务端能力自动协商；服务端未启用 TLS 时使用普通连接".into());
+        } else {
+            notes.push(
+                match config.tls {
+                    DbTls::VerifyIdentity => "TLS：验证系统 CA 证书和主机名",
+                    DbTls::Required => "TLS：强制加密但不验证证书身份",
+                    DbTls::Disabled => "TLS 已关闭，数据通过明文 TCP 传输",
+                }
+                .into(),
+            );
+        }
         inner.sessions.insert(id.clone(), Arc::new(config));
         Ok(DbSession {
             id,
@@ -1200,6 +1213,7 @@ mod tests {
         mut stream: tokio::net::TcpStream,
         trace: Arc<Mutex<Vec<String>>>,
         closed: Arc<tokio::sync::Notify>,
+        reject_nonconstant_set: bool,
     ) -> std::io::Result<()> {
         let capabilities: u32 = 1 | 4 | 8 | 512 | 8192 | 32768 | (1 << 19);
         let mut hello = vec![10];
@@ -1245,7 +1259,12 @@ mod tests {
             }
             let sql = String::from_utf8_lossy(&packet[1..]).into_owned();
             trace.lock().unwrap().push(sql.clone());
-            if sql.contains("999") {
+            if reject_nonconstant_set && sql.starts_with("SET ") && sql.contains("SELECT") {
+                let mut error = vec![255, 81, 4];
+                error.extend(b"#HY000SET does not support non-constant expressions");
+                wire_packet(&mut stream, 1, &error).await?;
+                return Ok(());
+            } else if sql.contains("999") {
                 let _ = read_packet(&mut stream).await;
                 closed.notify_one();
                 return Ok(());
@@ -1277,6 +1296,16 @@ mod tests {
         Arc<tokio::sync::Notify>,
         tokio::task::JoinHandle<()>,
     ) {
+        wire_fixture_mode(false).await
+    }
+    async fn wire_fixture_mode(
+        reject_nonconstant_set: bool,
+    ) -> (
+        DbConfig,
+        Arc<Mutex<Vec<String>>>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let trace = Arc::new(Mutex::new(vec![]));
         let closed = Arc::new(tokio::sync::Notify::new());
@@ -1289,7 +1318,7 @@ mod tests {
                 let log = log.clone();
                 let notify = notifier.clone();
                 tokio::spawn(async move {
-                    let _ = fixture_connection(stream, log, notify).await;
+                    let _ = fixture_connection(stream, log, notify, reject_nonconstant_set).await;
                 });
             }
         });
@@ -1309,6 +1338,107 @@ mod tests {
             task,
         )
     }
+    #[tokio::test]
+    async fn doris_automatically_connects_to_a_non_tls_server_with_legacy_tls_settings() {
+        let (mut config, trace, _, listener) = wire_fixture().await;
+        config.kind = DbKind::Doris;
+        for policy in [DbTls::VerifyIdentity, DbTls::Required, DbTls::Disabled] {
+            config.tls = policy;
+            test_connection(config.clone())
+                .await
+                .expect("Doris negotiates transport without user TLS input");
+        }
+        assert!(trace.lock().unwrap().iter().any(|sql| sql == "SELECT 1"));
+        assert!(
+            !trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|sql| sql == "START TRANSACTION READ ONLY")
+        );
+        listener.abort();
+    }
+    #[tokio::test]
+    async fn doris_initialization_does_not_send_nonconstant_sql_mode_with_or_without_database() {
+        let (mut config, trace, _, listener) = wire_fixture_mode(true).await;
+        config.kind = DbKind::Doris;
+        for database in ["demo", ""] {
+            config.database = database.into();
+            test_connection(config.clone())
+                .await
+                .expect("Doris-compatible initialization and optional database");
+        }
+        let queries = trace.lock().unwrap();
+        assert!(
+            queries
+                .iter()
+                .filter(|sql| sql.as_str() == "SELECT 1")
+                .count()
+                >= 2
+        );
+        assert!(
+            !queries
+                .iter()
+                .any(|sql| sql.starts_with("SET ") && sql.contains("sql_mode"))
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|sql| sql.starts_with("SET ") && sql.contains("NAMES"))
+        );
+        listener.abort();
+    }
+
+    #[tokio::test]
+    async fn doris_uses_tls_when_advertised_and_never_retries_a_failed_upgrade_as_plaintext() {
+        let (mut config, _, _, unused) = wire_fixture().await;
+        unused.abort();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.port = listener.local_addr().unwrap().port();
+        config.kind = DbKind::Doris;
+        config.tls = DbTls::Disabled; // A historical field must not disable automatic negotiation.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let capabilities: u32 = 1 | 4 | 8 | 512 | 2048 | 8192 | 32768 | (1 << 19);
+            let mut hello = vec![10];
+            hello.extend(b"8.0.36-fixture\0");
+            hello.extend(1u32.to_le_bytes());
+            hello.extend(b"12345678\0");
+            hello.extend((capabilities as u16).to_le_bytes());
+            hello.push(45);
+            hello.extend(2u16.to_le_bytes());
+            hello.extend(((capabilities >> 16) as u16).to_le_bytes());
+            hello.push(21);
+            hello.extend([0; 10]);
+            hello.extend(b"abcdefghijkl\0mysql_native_password\0");
+            wire_packet(&mut stream, 0, &hello).await.unwrap();
+            let packet = read_packet(&mut stream).await.unwrap();
+            let requested_tls = packet.len() == 32
+                && u32::from_le_bytes(packet[..4].try_into().unwrap()) & 2048 != 0;
+            drop(stream); // Abort TLS intentionally; the client must report failure.
+            let retried = tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_ok();
+            (requested_tls, retried)
+        });
+        let result = tokio::time::timeout(Duration::from_secs(3), test_connection(config))
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "TLS upgrade failure must not become a successful plaintext connection"
+        );
+        let (requested_tls, retried) = server.await.unwrap();
+        assert!(
+            requested_tls,
+            "Doris must negotiate TLS when the server advertises it"
+        );
+        assert!(
+            !retried,
+            "TLS upgrade failure must not trigger another plaintext connection"
+        );
+    }
+
     async fn wait_finished(service: &DbService, id: &str) -> DbPage {
         for _ in 0..100 {
             let page = service
@@ -1584,7 +1714,9 @@ mod tests {
             let (done, closed) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                let _ = fixture_connection(stream, log, Arc::new(tokio::sync::Notify::new())).await;
+                let _ =
+                    fixture_connection(stream, log, Arc::new(tokio::sync::Notify::new()), false)
+                        .await;
                 let _ = done.send(());
             });
             test_connection(DbConfig {
