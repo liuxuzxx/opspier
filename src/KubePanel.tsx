@@ -1,4 +1,5 @@
 import {useEffect,useRef,useState} from 'react';
+import KubeTerminal from './KubeTerminal';
 import {invoke} from '@tauri-apps/api/core';
 import {Alert,AutoComplete,Button,Card,Checkbox,Empty,Input,Select,Space,Table,Tabs,Tag,Tooltip,Typography} from 'antd';
 import {RESOURCE_KINDS,acceptKubeResult,appendLog,namespaceColor,statusColor} from './kube-model';
@@ -13,6 +14,7 @@ const fallback:Resource[]=[...RESOURCE_KINDS,'customresourcedefinitions'].map(id
 const mono={fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace',whiteSpace:'pre-wrap' as const,overflowWrap:'anywhere' as const};
 function resourceLabel(resource:Resource){return resource.id.startsWith('custom:')?`${resource.kind} · ${resource.group}/${resource.version} · ${resource.namespaced?'命名空间':'集群'}`:labels[resource.id]??resource.kind;}
 export default function KubePanel({initialSelection}:{initialSelection:KubeSelection}){
+ const [mode,setMode]=useState<'resources'|'terminal'>('resources');
  const [viewportHeight,setViewportHeight]=useState(()=>window.innerHeight);
  useEffect(()=>{const resize=()=>setViewportHeight(window.innerHeight);window.addEventListener('resize',resize);return()=>window.removeEventListener('resize',resize);},[]);
  const mounted=useRef(true);const [selection,setSelection]=useState(initialSelection);const session=useRef<KubeSelection|null>(initialSelection);
@@ -107,12 +109,14 @@ export default function KubePanel({initialSelection}:{initialSelection:KubeSelec
  const selectedResource=selectedSnapshot.current?.scope.resourceId;
  return <Space className="compact-workspace" orientation="vertical" size={8} style={{width:'100%'}}>
   <div className="workspace-toolbar"><Space wrap size={8}>
-   <Tooltip title="只读浏览；核心Secrets仅显示安全元数据"><Tag color="blue">只读</Tag></Tooltip>
+   <Select aria-label="Kubernetes视图" size="small" value={mode} onChange={setMode} options={[{value:'resources',label:'资源浏览'},{value:'terminal',label:'kubectl 终端'}]} style={{width:150}}/>{mode==='resources'&&<Tooltip title="只读浏览；核心Secrets仅显示安全元数据"><Tag color="blue">只读</Tag></Tooltip>}
    <Select aria-label="Context" size="small" value={selection.context} options={selection.contexts.map(value=>({value,label:value}))} onChange={value=>void switchSelection(value)} disabled={switching} style={{width:200}}/>
-   <AutoComplete aria-label="命名空间" size="small" allowClear value={namespaceInput} options={namespaceChoices.map(value=>({value,label:<Tag color={namespaceColor(value)}>{value}</Tag>}))} onSelect={changeNamespace} onClear={()=>changeNamespace('')} onChange={value=>{setNamespaceInput(value);if(!value)changeNamespace('');}} filterOption={(input,option)=>input===desired.namespace||String(option?.value??'').toLowerCase().includes(input.toLowerCase())} disabled={switching||!resource.namespaced} style={{width:210}}><Input aria-label="手动输入命名空间" maxLength={63} placeholder="全部命名空间 · 可选可输入" onPressEnter={()=>changeNamespace(namespaceInput)}/></AutoComplete>
-   <Typography.Text type="secondary">{resource.namespaced?(desired.namespace||'全部命名空间'):'集群范围'}</Typography.Text>
+   <AutoComplete aria-label="命名空间" size="small" allowClear value={namespaceInput} options={namespaceChoices.map(value=>({value,label:<Tag color={namespaceColor(value)}>{value}</Tag>}))} onSelect={changeNamespace} onClear={()=>changeNamespace('')} onChange={value=>{setNamespaceInput(value);if(!value)changeNamespace('');}} filterOption={(input,option)=>input===desired.namespace||String(option?.value??'').toLowerCase().includes(input.toLowerCase())} disabled={switching||(mode==='resources'&&!resource.namespaced)} style={{width:210}}><Input aria-label="手动输入命名空间" maxLength={63} placeholder={mode==='terminal'?'空为 default · 可选可输入':'全部命名空间 · 可选可输入'} onPressEnter={()=>changeNamespace(namespaceInput)}/></AutoComplete>
+   <Typography.Text type="secondary">{mode==='terminal'?(desired.namespace||'default'):resource.namespaced?(desired.namespace||'全部命名空间'):'集群范围'}</Typography.Text>
   </Space></div>
   {namespaceWarning&&<Typography.Text type="warning">{namespaceWarning}</Typography.Text>}
+  <KubeTerminal key={`${selection.sessionId}/${selection.generation}`} selection={selection} namespace={desired.namespace} visible={mode==='terminal'} suspended={switching}/>
+  <div style={{display:mode==='resources'?'block':'none'}}>
   {catalog.warning&&<Typography.Text type="warning">{catalog.warning}</Typography.Text>}
   {(error||browserState.error)&&<Alert type="error" showIcon title={error||browserState.error}/>}
   {pagingNotice&&<Typography.Text type="warning">{pagingNotice}</Typography.Text>}
@@ -136,5 +140,6 @@ export default function KubePanel({initialSelection}:{initialSelection:KubeSelec
     <Checkbox checked={follow} onChange={e=>setFollow(e.target.checked)}>跟随</Checkbox><Button onClick={()=>void startLogs()} disabled={!container||!!logId||startingLogs||!interactive}>读取日志</Button><Button onClick={()=>void stopLogs()} disabled={!logId&&!startingLogs}>停止日志</Button><Typography.Text type="secondary">{logStatus}</Typography.Text><Input.Search aria-label="搜索已加载日志" placeholder="搜索已加载日志" value={logSearch} onChange={e=>setLogSearch(e.target.value)} style={{width:240}} allowClear/>
    </Space>{dropped>0&&<Alert type="warning" title="输出已截断，保留最近日志"/>}<pre aria-label="Pod容器日志" style={{...mono,margin:0,padding:16,minHeight:200,maxHeight:420,overflow:'auto',background:'#101820',color:'#d8e6ef',borderRadius:6}}>{filteredLogs||'暂无日志'}</pre></Space>}]:[])
   ]}/></Card>}
+  </div>
  </Space>;
 }

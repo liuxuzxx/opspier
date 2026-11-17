@@ -40,3 +40,11 @@ test('MinIO stays in object storage and saved keys are bound to endpoint and sig
  assert.equal(credentialTargetUnchanged(before,{...before,endpoint:'https://other.example.test:9000'}),false);
  assert.equal(credentialTargetUnchanged(before,{...before,region:'eu-west-1'}),false);
 });
+
+test('Nacos category and saved authentication stay bound to endpoint and auth mode',()=>{
+ const before={driver:'nacos',endpoint:'https://registry.example.test/nacos',authentication:'password',namespace:'team-a'};
+ assert.equal(categoryFor('nacos'),'配置与注册');
+ assert.equal(credentialTargetUnchanged(before,{...before,namespace:'team-b'}),true);
+ assert.equal(credentialTargetUnchanged(before,{...before,endpoint:'https://other.example.test/nacos'}),false);
+ assert.equal(credentialTargetUnchanged(before,{...before,authentication:'none'}),false);
+});

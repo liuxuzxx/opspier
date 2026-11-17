@@ -59,6 +59,7 @@ pub enum ProfileSettings {
     Doris(DatabaseSettings),
     Kubernetes(KubeSettings),
     Minio(crate::minio_service::MinioSettings),
+    Nacos(crate::nacos::NacosSettings),
 }
 impl ProfileSettings {
     pub fn driver(&self) -> &'static str {
@@ -68,6 +69,7 @@ impl ProfileSettings {
             Self::Doris(_) => "doris",
             Self::Kubernetes(_) => "kubernetes",
             Self::Minio(_) => "minio",
+            Self::Nacos(_) => "nacos",
         }
     }
     pub fn target(&self) -> String {
@@ -87,6 +89,8 @@ impl ProfileSettings {
                     .unwrap_or_default()
             }
             Self::Kubernetes(s) => format!("kubernetes:{}", s.snapshot_id),
+            Self::Nacos(s) => serde_json::to_string(&("nacos", &s.endpoint, &s.authentication))
+                .unwrap_or_default(),
             Self::Minio(s) => {
                 serde_json::to_string(&("minio", &s.endpoint, &s.region)).unwrap_or_default()
             }
@@ -118,6 +122,7 @@ impl ProfileSettings {
                     && ["auto", "verifyIdentity", "required", "disabled"].contains(&s.tls.as_str())
             }
             Self::Minio(s) => s.validate().is_ok(),
+            Self::Nacos(s) => s.validate().is_ok(),
             Self::Kubernetes(s) => {
                 !s.contexts.is_empty()
                     && s.contexts.len() <= 200
@@ -467,6 +472,12 @@ impl ProfileStore {
             }
             CredentialChange::Remove => None,
             CredentialChange::Replace(material) => {
+                if let ProfileSettings::Nacos(s) = &draft.settings {
+                    if s.authentication != "password" {
+                        return Err("未启用认证的 Nacos 不保存账号密码".into());
+                    }
+                    crate::nacos::NacosMaterial::decode(&material)?;
+                }
                 if matches!(&draft.settings, ProfileSettings::Minio(_)) {
                     crate::minio_service::MinioMaterial::decode(&material)?;
                 }
@@ -612,7 +623,9 @@ impl ProfileStore {
                 || !text_valid(&profile.source_id, 256)
                 || matches!(
                     &profile.settings,
-                    ProfileSettings::Kubernetes(_) | ProfileSettings::Minio(_)
+                    ProfileSettings::Kubernetes(_)
+                        | ProfileSettings::Minio(_)
+                        | ProfileSettings::Nacos(_)
                 )
             {
                 return Err("旧连接字段无效，原记录保留".into());

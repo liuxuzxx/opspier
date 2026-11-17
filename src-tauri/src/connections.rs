@@ -174,6 +174,10 @@ pub enum CredentialInput {
         access_key: String,
         secret_key: String,
     },
+    ReplaceNacos {
+        username: String,
+        password: String,
+    },
     Remove,
 }
 fn apply_save(
@@ -187,7 +191,9 @@ fn apply_save(
         CredentialInput::ReplacePassword { value } => {
             if matches!(
                 draft.settings,
-                ProfileSettings::Kubernetes(_) | ProfileSettings::Minio(_)
+                ProfileSettings::Kubernetes(_)
+                    | ProfileSettings::Minio(_)
+                    | ProfileSettings::Nacos(_)
             ) {
                 return Err("集群凭据必须通过导入保存".into());
             }
@@ -206,6 +212,17 @@ fn apply_save(
             };
             material.validate()?;
             CredentialChange::Replace(serde_json::to_vec(&material).map_err(|_| "密钥材料无效")?)
+        }
+        CredentialInput::ReplaceNacos { username, password } => {
+            let ProfileSettings::Nacos(settings) = &draft.settings else {
+                return Err("此凭据只适用于 Nacos".into());
+            };
+            if settings.authentication != "password" {
+                return Err("未启用认证的 Nacos 不保存账号密码".into());
+            }
+            let material = crate::nacos::NacosMaterial { username, password };
+            material.validate()?;
+            CredentialChange::Replace(serde_json::to_vec(&material).map_err(|_| "凭据材料无效")?)
         }
         CredentialInput::ImportKube { token, binding } => {
             binding.validate(&state.store)?;
@@ -867,6 +884,121 @@ pub async fn profiles_connect_minio(
             .secret
             .ok_or("此连接没有保存的密钥，请编辑后保存")?,
     )?;
+    let session = service.connect(settings, material).await?;
+    if let Err(error) = state.store.snapshot(&id, revision) {
+        let _ = service.close(&session.id);
+        return Err(error);
+    }
+    Ok(session)
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum NacosTestCredential {
+    Keep,
+    ReplaceNacos { username: String, password: String },
+    Remove,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NacosProfileTest {
+    id: Option<String>,
+    expected_revision: Option<u64>,
+    settings: ProfileSettings,
+    credential: NacosTestCredential,
+}
+fn prepare_nacos_test(
+    store: &ProfileStore,
+    request: NacosProfileTest,
+) -> Result<
+    (
+        crate::nacos::NacosSettings,
+        Option<crate::nacos::NacosMaterial>,
+    ),
+    String,
+> {
+    request.settings.validate()?;
+    let ProfileSettings::Nacos(settings) = &request.settings else {
+        return Err("连接类型不是 Nacos".into());
+    };
+    let saved = match (&request.id, request.expected_revision) {
+        (Some(id), Some(revision)) => Some(store.snapshot(id, revision)?),
+        (None, None) => None,
+        _ => return Err("编辑版本无效".into()),
+    };
+    if saved
+        .as_ref()
+        .is_some_and(|p| !matches!(p.settings, ProfileSettings::Nacos(_)))
+    {
+        return Err("连接类型不是 Nacos".into());
+    }
+    let material = if settings.authentication == "none" {
+        None
+    } else {
+        Some(match request.credential {
+            NacosTestCredential::Keep => {
+                let saved = saved.ok_or("此连接没有保存的账号密码")?;
+                if saved.settings.target() != request.settings.target() {
+                    return Err("认证目标已变化，请替换凭据后测试".into());
+                }
+                crate::nacos::NacosMaterial::decode(
+                    &store
+                        .resolve(&saved.id, saved.revision)?
+                        .secret
+                        .ok_or("此连接没有保存的账号密码")?,
+                )?
+            }
+            NacosTestCredential::ReplaceNacos { username, password } => {
+                let m = crate::nacos::NacosMaterial { username, password };
+                m.validate()?;
+                m
+            }
+            NacosTestCredential::Remove => return Err("请提供账号密码后测试".into()),
+        })
+    };
+    Ok((settings.clone(), material))
+}
+#[tauri::command]
+pub async fn profiles_test_nacos(
+    state: tauri::State<'_, Arc<Connections>>,
+    request: NacosProfileTest,
+) -> Result<(), String> {
+    let store = state.store.clone();
+    let saved = request.id.clone().zip(request.expected_revision);
+    let target = store.clone();
+    let (settings, material) =
+        tokio::task::spawn_blocking(move || prepare_nacos_test(&target, request))
+            .await
+            .map_err(|_| "Nacos 测试凭据读取任务已停止")??;
+    crate::nacos::test_connection(settings, material).await?;
+    if let Some((id, revision)) = saved {
+        store.snapshot(&id, revision)?;
+    }
+    Ok(())
+}
+#[tauri::command]
+pub async fn profiles_connect_nacos(
+    state: tauri::State<'_, Arc<Connections>>,
+    service: tauri::State<'_, crate::nacos::NacosService>,
+    id: String,
+    revision: u64,
+) -> Result<crate::nacos::NacosSession, String> {
+    let resolved = resolve(&state, id.clone(), revision).await?;
+    let ProfileSettings::Nacos(settings) = resolved.profile.settings else {
+        return Err("连接类型不是 Nacos".into());
+    };
+    let material = if settings.authentication == "none" {
+        None
+    } else {
+        Some(crate::nacos::NacosMaterial::decode(
+            &resolved.secret.ok_or("此连接没有保存的账号密码")?,
+        )?)
+    };
     let session = service.connect(settings, material).await?;
     if let Err(error) = state.store.snapshot(&id, revision) {
         let _ = service.close(&session.id);

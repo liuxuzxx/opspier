@@ -46,6 +46,7 @@ struct Session {
     context: String,
     namespace: String,
     cancel: watch::Sender<bool>,
+    context_cancel: watch::Sender<bool>,
     logs: Option<LogSession>,
     logs_revision: u64,
     browser: query::BrowserState,
@@ -65,6 +66,7 @@ impl Drop for LogSession {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
+        let _ = self.context_cancel.send(true);
         self.browser.cancel_all();
     }
 }
@@ -491,12 +493,14 @@ impl KubeService {
             return Err("配置加载已取消".into());
         }
         let (cancel, _) = watch::channel(false);
+        let (context_cancel, _) = watch::channel(false);
         hub.session = Some(Session {
             config,
             client,
             context,
             namespace,
             cancel,
+            context_cancel,
             logs: None,
             logs_revision: 0,
             browser: query::BrowserState::default(),
@@ -526,9 +530,12 @@ impl KubeService {
         }
         let session = hub.session.as_mut().ok_or("连接已关闭")?;
         let _ = session.cancel.send(true);
+        let _ = session.context_cancel.send(true);
         session.logs = None;
         let (cancel, _) = watch::channel(false);
+        let (context_cancel, _) = watch::channel(false);
         session.cancel = cancel;
+        session.context_cancel = context_cancel;
         session.browser.cancel_all();
         session.browser = query::BrowserState::default();
         session.client = client;
@@ -544,9 +551,12 @@ impl KubeService {
         }
         let session = hub.session.as_mut().ok_or("请先打开 kubeconfig")?;
         let _ = session.cancel.send(true);
+        let _ = session.context_cancel.send(true);
         session.logs = None;
         let (cancel, _) = watch::channel(false);
+        let (context_cancel, _) = watch::channel(false);
         session.cancel = cancel;
+        session.context_cancel = context_cancel;
         hub.generation += 1;
         Self::selection(&hub)
     }
@@ -629,7 +639,20 @@ impl KubeService {
         })
     }
     async fn namespaces(&self, expected: u64) -> Result<KubeNamespaces, String> {
-        let snap = self.snapshot(expected).await?;
+        // 命名空间属于当前Context，不随资源浏览、搜索或目录更新取消。
+        let snap = {
+            let hub = self.hub.lock().await;
+            if hub.generation != expected {
+                return Err("请求已取消：连接代次发生变化".into());
+            }
+            let session = hub.session.as_ref().ok_or("请先打开 kubeconfig")?;
+            Snapshot {
+                client: session.client.clone(),
+                namespace: session.namespace.clone(),
+                generation: expected,
+                cancel: session.context_cancel.subscribe(),
+            }
+        };
         let value = self
             .json(
                 snap,
@@ -986,6 +1009,29 @@ impl KubeRuntimes {
             .get(id)
             .cloned()
             .ok_or_else(|| "集群工作区已关闭".into())
+    }
+    pub(crate) async fn terminal_sessions(&self) -> std::collections::HashSet<String> {
+        self.sessions.lock().await.keys().cloned().collect()
+    }
+    pub(crate) async fn terminal_current(&self, id: &str, generation: u64) -> Result<(), String> {
+        self.get(id).await?.verify(generation).await
+    }
+    pub(crate) async fn terminal_target(
+        &self,
+        id: &str,
+        generation: u64,
+        namespace: &str,
+    ) -> Result<(Kubeconfig, watch::Receiver<bool>), String> {
+        let service = self.get(id).await?;
+        let hub = service.hub.lock().await;
+        if hub.generation != generation {
+            return Err("终端连接代次已变化".into());
+        }
+        let session = hub.session.as_ref().ok_or("集群工作区已关闭")?;
+        let target =
+            crate::kubectl_terminal::target::narrow(&session.config, &session.context, namespace)?;
+        // 资源页的范围变化不能结束同一Context下正在运行的终端。
+        Ok((target, session.context_cancel.subscribe()))
     }
     pub async fn open_config(
         &self,

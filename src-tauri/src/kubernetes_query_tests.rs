@@ -16,6 +16,12 @@ struct ApiState {
     header_error: Arc<std::sync::atomic::AtomicU16>,
     catalog_header_error: Arc<std::sync::atomic::AtomicBool>,
     catalog_tail_error: Arc<std::sync::atomic::AtomicU16>,
+    hold_namespaces: Arc<std::sync::atomic::AtomicBool>,
+    namespace_started: Arc<tokio::sync::Notify>,
+    namespace_release: Arc<tokio::sync::Notify>,
+    schema_catalog: Arc<std::sync::atomic::AtomicBool>,
+    schema_size_kib: Arc<std::sync::atomic::AtomicUsize>,
+    schema_items: Arc<std::sync::atomic::AtomicUsize>,
 }
 fn http_failure(code: u16, hang: bool) -> Response {
     let status = StatusCode::from_u16(code).unwrap();
@@ -66,7 +72,44 @@ async fn api(State(s): State<ApiState>, method: Method, headers: HeaderMap, uri:
         }
         return axum::Json(json!({"metadata":{"continue":format!("page{}",page+1)},"items":[{"metadata":{"name":"plain","namespace":"error-tail"}}],"padding":"x".repeat(7*1024*1024)})).into_response();
     }
+    if path == "/api/v1/namespaces" {
+        if s.hold_namespaces.load(std::sync::atomic::Ordering::SeqCst) {
+            s.namespace_started.notify_one();
+            s.namespace_release.notified().await;
+        }
+        return axum::Json(json!({"metadata":{},"items":[{"metadata":{"name":"ops"}},{"metadata":{"name":"review"}}]})).into_response();
+    }
     if path == "/apis/apiextensions.k8s.io/v1/customresourcedefinitions" {
+        if s.schema_catalog.load(std::sync::atomic::Ordering::SeqCst) {
+            let parameters: std::collections::HashMap<String, String> =
+                url::form_urlencoded::parse(query.as_bytes())
+                    .into_owned()
+                    .collect();
+            let limit = parameters
+                .get("limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(200);
+            let start = parameters
+                .get("continue")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let configured_total = s.schema_items.load(std::sync::atomic::Ordering::SeqCst);
+            let total = if configured_total == 0 {
+                20
+            } else {
+                configured_total
+            };
+            let configured_size = s.schema_size_kib.load(std::sync::atomic::Ordering::SeqCst);
+            let size_kib = if configured_size == 0 {
+                450
+            } else {
+                configured_size
+            };
+            let end = (start + limit).min(total);
+            let items: Vec<Value> = (start..end).map(|i| json!({"metadata":{"name":format!("kind{i}.schema.example")},"spec":{"group":"schema.example","names":{"plural":format!("kind{i}"),"kind":format!("Kind{i}")},"scope":"Namespaced","versions":[{"name":"v1","served":true,"schema":{"openAPIV3Schema":{"description":"x".repeat(size_kib * 1024)}}}]}})).collect();
+            return axum::Json(json!({"metadata":{"continue":if end<total {end.to_string()} else {String::new()}},"items":items})).into_response();
+        }
+
         if s.catalog_header_error
             .load(std::sync::atomic::Ordering::SeqCst)
         {
@@ -708,4 +751,169 @@ async fn failing_budget_tail_directory_keeps_the_previous_catalog_and_row_scope(
         s.close().await;
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn regression_namespace_lookup_survives_browser_scope_and_catalog_changes() {
+    let (service, state, server) = service().await;
+    let generation = service.hub.lock().await.generation;
+    state
+        .hold_namespaces
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let reader = service.clone();
+    let pending = tokio::spawn(async move { reader.namespaces(generation).await });
+    state.namespace_started.notified().await;
+    let catalog = service.resources(generation).await.unwrap();
+    let mut request = input(1, "pods", "review", "");
+    request.catalog_revision = catalog.catalog_revision;
+    service.query(generation, request).await.unwrap();
+    state.namespace_release.notify_one();
+    let result = pending
+        .await
+        .unwrap()
+        .expect("同一Context的资源浏览和CRD发现不能取消命名空间查询");
+    assert_eq!(result.namespaces, vec!["ops", "review"]);
+    service.close().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_terminal_context_lease_survives_browser_namespace_changes_but_ends_on_close() {
+    let (service, _, server) = service().await;
+    let generation = service.hub.lock().await.generation;
+    let runtimes = KubeRuntimes::default();
+    runtimes
+        .sessions
+        .lock()
+        .await
+        .insert("owned".into(), service.clone());
+    let (_, mut context_cancel) = runtimes
+        .terminal_target("owned", generation, "ops")
+        .await
+        .unwrap();
+    service
+        .query(generation, input(1, "pods", "review", ""))
+        .await
+        .unwrap();
+    assert!(
+        !context_cancel.has_changed().unwrap(),
+        "浏览器范围变化不能结束同一Context的终端"
+    );
+    service.close().await;
+    context_cancel.changed().await.ok();
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_crd_discovery_paginates_large_schemas_instead_of_failing_the_first_body_limit()
+{
+    let (service, state, server) = service().await;
+    let generation = service.hub.lock().await.generation;
+    state
+        .schema_catalog
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = service.resources(generation).await.unwrap();
+    assert!(
+        result.warning.is_none(),
+        "可分页读取的CRD目录不应因为整页Schema过大而失败"
+    );
+    assert_eq!(
+        result
+            .resources
+            .iter()
+            .filter(|r| r.group == "schema.example")
+            .count(),
+        20
+    );
+    assert!(state.trace.lock().unwrap().len() >= 2);
+    service.close().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn namespace_lookup_is_cancelled_when_the_context_generation_changes() {
+    let (service, state, server) = service().await;
+    let generation = service.hub.lock().await.generation;
+    state
+        .hold_namespaces
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let reader = service.clone();
+    let pending = tokio::spawn(async move { reader.namespaces(generation).await });
+    state.namespace_started.notified().await;
+    service
+        .select(generation, "local", Some("review"))
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(error) if error.contains("取消")));
+    state.namespace_release.notify_one();
+    service.close().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_crd_oversized_page_shrinks_without_losing_a_readable_catalog() {
+    let (service, state, server) = service().await;
+    let generation = service.hub.lock().await.generation;
+    state
+        .schema_catalog
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .schema_size_kib
+        .store(900, std::sync::atomic::Ordering::SeqCst);
+    state
+        .schema_items
+        .store(10, std::sync::atomic::Ordering::SeqCst);
+    let catalog = service.resources(generation).await.unwrap();
+    assert!(
+        catalog.warning.is_none(),
+        "总目录不足16MiB时，应缩页继续读取而不是放弃发现"
+    );
+    assert_eq!(
+        catalog
+            .resources
+            .iter()
+            .filter(|r| r.group == "schema.example")
+            .count(),
+        10
+    );
+    assert!(
+        state
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.contains("limit=5"))
+    );
+    service.close().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_single_oversized_crd_has_an_explicit_warning_and_bounded_retries() {
+    let (service, state, server) = service().await;
+    let generation = service.hub.lock().await.generation;
+    state
+        .schema_catalog
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .schema_size_kib
+        .store(9 * 1024, std::sync::atomic::Ordering::SeqCst);
+    state
+        .schema_items
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let catalog = service.resources(generation).await.unwrap();
+    assert!(
+        catalog
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("单个CRD"))
+    );
+    assert!(catalog.resources.iter().any(|r| r.id == "pods"));
+    assert!(state.trace.lock().unwrap().len() <= 4);
+    service.close().await;
+    server.abort();
 }

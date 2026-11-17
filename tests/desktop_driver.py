@@ -72,3 +72,47 @@ class Driver:
     def screenshot(self, path):
         path.write_bytes(base64.b64decode(self.cmd("GET", "/screenshot")))
 
+
+
+def request_native_close(window_id):
+    """只向隔离显示器中的测试窗口发送原生关闭协议，触发真实应用退出事件。"""
+    import ctypes
+    import os
+    assert os.environ.get('DISPLAY') == ':196'
+
+    class ClientData(ctypes.Union):
+        """X11客户端消息中的固定大小数据区。"""
+        _fields_ = [('bytes', ctypes.c_char * 20), ('shorts', ctypes.c_short * 10), ('longs', ctypes.c_long * 5)]
+
+    class ClientMessage(ctypes.Structure):
+        """原生窗口管理关闭事件的布局。"""
+        _fields_ = [('type', ctypes.c_int), ('serial', ctypes.c_ulong), ('send_event', ctypes.c_int),
+                    ('display', ctypes.c_void_p), ('window', ctypes.c_ulong), ('message_type', ctypes.c_ulong),
+                    ('format', ctypes.c_int), ('data', ClientData)]
+
+    class Event(ctypes.Union):
+        """保留XEvent规定的完整内存大小，供XSendEvent读取。"""
+        _fields_ = [('client', ClientMessage), ('padding', ctypes.c_long * 24)]
+
+    x11 = ctypes.CDLL('libX11.so.6')
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.POINTER(Event)]
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    display = x11.XOpenDisplay(None)
+    assert display, 'isolated X11 display unavailable'
+    try:
+        event = Event()
+        event.client.type = 33
+        event.client.display = display
+        event.client.window = int(window_id)
+        event.client.message_type = x11.XInternAtom(display, b'WM_PROTOCOLS', 0)
+        event.client.format = 32
+        event.client.data.longs[0] = x11.XInternAtom(display, b'WM_DELETE_WINDOW', 0)
+        assert x11.XSendEvent(display, int(window_id), 0, 0, ctypes.byref(event)) != 0
+        x11.XFlush(display)
+    finally:
+        x11.XCloseDisplay(display)

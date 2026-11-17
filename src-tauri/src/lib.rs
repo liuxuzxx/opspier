@@ -3,11 +3,14 @@ pub mod connections;
 mod credential_tests;
 pub mod credentials;
 pub mod db;
+pub mod http_tool;
 pub mod kube_import;
 #[cfg(test)]
 mod kube_import_tests;
+pub mod kubectl_terminal;
 pub mod kubernetes;
 pub mod minio_service;
+pub mod nacos;
 #[cfg(test)]
 mod profile_tests;
 pub mod profiles;
@@ -30,6 +33,7 @@ pub fn run() {
         .manage(Arc::new(ssh::SshService::default()))
         .manage(db::DbService::default())
         .manage(minio_service::MinioService::default())
+        .manage(nacos::NacosService::default())
         .manage(kubernetes::KubeRuntimes::default())
         .setup(|app| {
             let connections = connections::Connections::open(
@@ -37,6 +41,12 @@ pub fn run() {
             )
             .map_err(std::io::Error::other)?;
             app.manage(Arc::new(connections));
+            app.manage(
+                kubectl_terminal::runtime::TerminalService::new(
+                    app.path().app_cache_dir()?.join("kubectl-terminals-v1"),
+                )
+                .map_err(std::io::Error::other)?,
+            );
             if let Some(window) = app.get_webview_window("main") {
                 window.set_title(&format!(
                     "{} · 运维工作台 {}",
@@ -51,6 +61,21 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connections::kube_test_connection,
             connections::profiles_list,
+            connections::profiles_test_nacos,
+            connections::profiles_connect_nacos,
+            nacos::nacos_namespaces,
+            nacos::nacos_close,
+            nacos::config::nacos_configs,
+            nacos::config::nacos_config,
+            nacos::config::nacos_publish,
+            nacos::config::nacos_delete_config,
+            nacos::config::nacos_history,
+            nacos::config::nacos_history_config,
+            nacos::config::nacos_rollback,
+            nacos::naming::nacos_services,
+            nacos::naming::nacos_service,
+            nacos::naming::nacos_update_service,
+            nacos::naming::nacos_update_instance,
             connections::profiles_test_minio,
             connections::profiles_connect_minio,
             minio_service::minio_buckets,
@@ -91,6 +116,12 @@ pub fn run() {
             db::db_cancel,
             db::db_export_csv,
             db::db_forget_query,
+            kubectl_terminal::runtime::terminal_open,
+            kubectl_terminal::runtime::terminal_input,
+            kubectl_terminal::runtime::terminal_poll,
+            kubectl_terminal::runtime::terminal_resize,
+            kubectl_terminal::runtime::terminal_namespace,
+            kubectl_terminal::runtime::terminal_close,
             kubernetes::kube_open,
             kubernetes::kube_select,
             kubernetes::kube_namespaces,
@@ -107,7 +138,16 @@ pub fn run() {
             kubernetes::kube_logs_stop,
             kubernetes::kube_stop,
             kubernetes::kube_close,
+            http_tool::http_tool_request,
         ])
-        .run(tauri::generate_context!())
-        .expect("OpsPier 桌面启动失败");
+        .build(tauri::generate_context!())
+        .expect("OpsPier 桌面启动失败")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(service) = app.try_state::<kubectl_terminal::runtime::TerminalService>()
+                {
+                    service.close_all();
+                }
+            }
+        });
 }

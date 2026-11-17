@@ -25,8 +25,9 @@ import tempfile
 import time
 import traceback
 sys.path.insert(0,str(Path(__file__).parent))
-from desktop_driver import Driver,free_port,ELEMENT
+from desktop_driver import Driver,free_port,ELEMENT,request_native_close
 from minio_desktop import verify as verify_minio
+from nacos_terminal_desktop import verify as verify_nacos_terminal
 sys.path.insert(0,str(Path(__file__).parent/'fixtures'))
 from desktop_services import start,start_tls_mysql
 ROOT=Path(__file__).resolve().parents[1]
@@ -50,7 +51,7 @@ class StableDriver(Driver):
         raise AssertionError('read-only UI condition timed out')
 
 
-def inside(output,application,previous_application=None,minio_only=False):
+def inside(output,application,previous_application=None,minio_only=False,nacos_terminal_only=False):
     private=Path(os.environ['HOME']);processes=[];logs=[];daemon=None;driver=None;driver_process=None;db=kube=tls_db=tls_linger=None
     report={'status':'running','scope':'actual release, private HOME/XDG/DBus/real GNOME keyring, loopback services','ui':[],'ipc':[],'measurements':{},'appRuns':[]}
     phase='startup';owned=[];login=secrets.token_hex(36).encode();password='db-'+secrets.token_hex(32);ssh_password='ssh-'+secrets.token_hex(32);token='kube-'+secrets.token_hex(32)
@@ -85,7 +86,7 @@ def inside(output,application,previous_application=None,minio_only=False):
     def start_app(label):
         nonlocal driver
         active=previous_application if label=='A-save' and previous_application else application
-        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier','0.1.8')
+        brand,version=('OPS','0.1.4') if active==previous_application else ('OpsPier',json.loads((ROOT/'package.json').read_text())['version'])
         session=driver.call('POST','/session',{'capabilities':{'alwaysMatch':{'browserName':'wry','tauri:options':{'application':str(active)}}}});driver.sid=session['sessionId']
         driver.cmd('POST','/timeouts',{'script':30000,'implicit':0,'pageLoad':30000});driver.cmd('POST','/window/rect',{'width':1460,'height':1060,'x':220,'y':10})
         driver.text('从左侧新建或打开连接');driver.text(f'{brand} {version}')
@@ -97,8 +98,22 @@ def inside(output,application,previous_application=None,minio_only=False):
         windows=subprocess.check_output([XDOTOOL,'search','--all','--pid',str(pids[0]),'--name',brand],text=True).split()
         titles=[subprocess.check_output([XDOTOOL,'getwindowname',w],text=True).strip() for w in windows]
         assert f'{brand} · 运维工作台 {version}' in titles;report['nativeTitle']=f'{brand} · 运维工作台 {version}'
-    def stop_app():
-        driver.cmd('DELETE','');driver.sid=''
+    def stop_app(graceful=False):
+        """区分原生关窗和驱动强制结束，避免把崩溃恢复契约误当正常退出。"""
+        if graceful:
+            pids=app_pids();assert len(pids)==1
+            windows=subprocess.check_output([XDOTOOL,'search','--all','--pid',str(pids[0]),'--name','OpsPier'],text=True).split()
+            owned=[window for window in windows if '运维工作台' in subprocess.check_output([XDOTOOL,'getwindowname',window],text=True)]
+            assert len(owned)==1
+            request_native_close(int(owned[0]))
+            deadline=time.monotonic()+10
+            while app_pids():
+                if time.monotonic()>deadline:raise RuntimeError('native close did not finish owned application cleanup')
+                time.sleep(.1)
+        try:driver.cmd('DELETE','')
+        except (OSError,RuntimeError):
+            if not graceful or app_pids():raise
+        driver.sid=''
         deadline=time.monotonic()+10
         while app_pids():
             if time.monotonic()>deadline:raise RuntimeError('owned application did not exit')
@@ -114,8 +129,8 @@ def inside(output,application,previous_application=None,minio_only=False):
     def profile_action(name,action):
         row=profile_row(name);driver.click(driver.wait("return [...arguments[0].querySelectorAll('button')].find(e=>e.textContent===arguments[1]&&!e.disabled)",row,action))
     def open_profile(name,wait_active=True):
-        row=profile_row(name);driver.click(driver.js("return arguments[0].querySelector('.profile-name')",row))
-        category=driver.js("return arguments[0].closest('.profile-category')?.querySelector('.category-heading')?.textContent",row)
+        row=profile_row(name);driver.click(driver.wait("return arguments[0].querySelector('.profile-name')",row))
+        category=driver.wait("return arguments[0].closest('.profile-category')?.querySelector('.category-heading')?.textContent",row)
         if wait_active and category!='主机与终端':driver.wait("return [...document.querySelectorAll('[role=tab][aria-selected=true]')].some(e=>e.textContent.includes(arguments[0]))||[...document.querySelectorAll('.ant-modal')].some(e=>e.getClientRects().length&&e.querySelector('.ant-modal-title')?.textContent==='选择要打开的 Context')",name)
     def saved_modal_closed():
         driver.wait("return [...document.querySelectorAll('.ant-modal')].every(e=>!e.getClientRects().length)")
@@ -219,6 +234,9 @@ def inside(output,application,previous_application=None,minio_only=False):
         for _ in range(100):
             try:driver.call('GET','/status');break
             except (OSError,RuntimeError):time.sleep(.1)
+        if nacos_terminal_only:
+            verify_nacos_terminal(driver,private,[],check,snapshot,new_profile,profile_action,open_profile,saved_modal_closed,start_app,stop_app)
+            report['status']='passed';return 0
         if minio_only:
             def restart_private_keyring():
                 nonlocal daemon
@@ -563,6 +581,8 @@ def inside(output,application,previous_application=None,minio_only=False):
             nonlocal daemon
             stop_keyring();daemon=start_keyring()
         verify_minio(driver,private,processes,needles,check,snapshot,new_profile,profile_action,open_profile,saved_modal_closed,start_app,stop_app,restart_private_keyring)
+        phase='nacos-terminal-native'
+        verify_nacos_terminal(driver,private,needles,check,snapshot,new_profile,profile_action,open_profile,saved_modal_closed,start_app,stop_app)
         # Original input files have been deleted. Scan all remaining ordinary profile/cache/log files,
         # including encrypted keyring files, for synthetic raw/base64 material.
         inspected=0;variants=needles+[base64.b64encode(secret) for secret in needles]
@@ -609,21 +629,22 @@ def inside(output,application,previous_application=None,minio_only=False):
             if service:service.shutdown();service.server_close()
         for log in logs:log.close()
         report['measurements']['webdriverReadRetries']=driver.read_retries if driver else 0
+        report['ownedProcessStatesAtCleanup']=[{'pid':pid,'state':Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[0]} for pid in owned if Path(f'/proc/{pid}/stat').exists()]
         report['cleanupEvidence']={'launchedProcessesExited':all(p.poll() is not None for p in processes),'ownedApplicationsExited':all(not Path(f'/proc/{pid}').exists() for pid in owned),'display196SocketRemoved':not Path('/tmp/.X11-unix/X196').exists()}
         (output/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
     return 0 if report['status']=='passed' else 1
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--inside',action='store_true');parser.add_argument('--minio-only',action='store_true');parser.add_argument('--previous-application',type=Path);parser.add_argument('--application',type=Path,default=Path(os.environ.get('CARGO_TARGET_DIR',str(CACHE/'target')))/'release/opspier');parser.add_argument('--output',type=Path,default=CACHE/'desktop-evidence');args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
-    if args.inside:return inside(args.output,args.application,args.previous_application,args.minio_only)
+    parser=argparse.ArgumentParser();parser.add_argument('--inside',action='store_true');parser.add_argument('--minio-only',action='store_true');parser.add_argument('--nacos-terminal-only',action='store_true');parser.add_argument('--previous-application',type=Path);parser.add_argument('--application',type=Path,default=Path(os.environ.get('CARGO_TARGET_DIR',str(CACHE/'target')))/'release/opspier');parser.add_argument('--output',type=Path,default=CACHE/'desktop-evidence');args=parser.parse_args();args.output.mkdir(parents=True,exist_ok=True)
+    if args.inside:return inside(args.output,args.application,args.previous_application,args.minio_only,args.nacos_terminal_only)
     with tempfile.TemporaryDirectory(prefix='ops-ui-') as directory:
         root=Path(directory)
         for part in ['config','data','cache','run','Downloads']:(root/part).mkdir(mode=0o700)
         (root/'config/user-dirs.dirs').write_text(f'XDG_DOWNLOAD_DIR="{root}/Downloads"\n')
-        env={key:os.environ[key] for key in ['PKG_CONFIG_SYSROOT_DIR','CARGO_TARGET_DIR','AIC_OPS_FIXTURE_PYTHON_PATH','OPSPIER_TEST_CACHE','OPSPIER_XDOTOOL','OPSPIER_XVFB','OPSPIER_TAURI_DRIVER','OPSPIER_WEBKIT_DRIVER','OPSPIER_MINIO_SERVER'] if key in os.environ}
+        env={key:os.environ[key] for key in ['PKG_CONFIG_SYSROOT_DIR','CARGO_TARGET_DIR','AIC_OPS_FIXTURE_PYTHON_PATH','OPSPIER_TEST_CACHE','OPSPIER_XDOTOOL','OPSPIER_XVFB','OPSPIER_TAURI_DRIVER','OPSPIER_WEBKIT_DRIVER','OPSPIER_MINIO_SERVER','OPSPIER_NACOS_DISTRIBUTION','OPSPIER_NACOS_BIND_GUARD'] if key in os.environ}
         env.update(PATH='/usr/local/bin:/usr/bin:/bin',HOME=directory,DISPLAY=':196',XDG_CONFIG_HOME=str(root/'config'),XDG_DATA_HOME=str(root/'data'),XDG_CACHE_HOME=str(root/'cache'),XDG_RUNTIME_DIR=str(root/'run'),LD_LIBRARY_PATH=os.environ.get('LD_LIBRARY_PATH',''),LANG='C.UTF-8',LC_ALL='C.UTF-8',TAURI_WEBVIEW_AUTOMATION='true',WEBKIT_DISABLE_COMPOSITING_MODE='1',GIO_USE_VFS='local',NO_PROXY='127.0.0.1,localhost')
-        run=subprocess.run(['dbus-run-session','--','/usr/bin/python3',str(Path(__file__).resolve()),'--inside','--application',str(args.application),'--output',str(args.output)]+(['--previous-application',str(args.previous_application)] if args.previous_application else [])+(['--minio-only'] if args.minio_only else []),env=env,timeout=900)
+        run=subprocess.run(['dbus-run-session','--','/usr/bin/python3',str(Path(__file__).resolve()),'--inside','--application',str(args.application),'--output',str(args.output)]+(['--previous-application',str(args.previous_application)] if args.previous_application else [])+(['--minio-only'] if args.minio_only else [])+(['--nacos-terminal-only'] if args.nacos_terminal_only else []),env=env,timeout=900)
         # Native chooser services must not leave a FUSE mount inside our disposable runtime.
         own_mount=root/'run/gvfs'
         if os.path.ismount(own_mount):

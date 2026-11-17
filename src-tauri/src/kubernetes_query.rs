@@ -199,6 +199,16 @@ pub(super) async fn bounded_json(
     if !status.is_success() {
         return Err(http_error(status.as_u16()));
     }
+    // 明确超出单页硬上限时不读取正文，允许目录缩页且不浪费传输预算。
+    if response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > RESPONSE_LIMIT as u64)
+    {
+        return Err(TOO_LARGE.into());
+    }
     let reader = response
         .into_body()
         .into_data_stream()
@@ -548,15 +558,18 @@ impl KubeService {
             let mut seen = HashSet::new();
             let mut count = 0;
             let mut versions = 0;
-            let mut bytes = 0;
+            let transferred = AtomicUsize::new(0);
             let mut warning = None;
+            // CRD包含完整Schema；同一游标超限时缩页，实际读入的失败正文也计入总预算。
+            let mut page_size = 10;
             for page in 0..32 {
-                let remaining = 16 * 1024 * 1024 - bytes;
+                let remaining =
+                    (16 * 1024 * 1024usize).saturating_sub(transferred.load(Ordering::Relaxed));
                 if remaining == 0 {
                     warning = Some("CRD目录达到累计传输上限，目录不完整".into());
                     break;
                 }
-                let mut params = ListParams::default().limit(200);
+                let mut params = ListParams::default().limit(page_size);
                 if !token.is_empty() {
                     params = params.continue_token(&token);
                 }
@@ -569,11 +582,11 @@ impl KubeService {
                         false,
                         None,
                         remaining.min(RESPONSE_LIMIT),
-                        None,
+                        Some(&transferred),
                     ),
                 )
                 .await;
-                let (value, size) = match response {
+                let (value, _size) = match response {
                     Err(_) => {
                         warning = Some("CRD发现达到30秒总时限，目录不完整".into());
                         break;
@@ -582,11 +595,18 @@ impl KubeService {
                         warning = Some("CRD发现达到16MiB累计传输上限，目录不完整".into());
                         break;
                     }
+                    Ok(Err(error)) if error == TOO_LARGE && page_size > 1 => {
+                        page_size = (page_size / 2).max(1);
+                        continue;
+                    }
+                    Ok(Err(error)) if error == TOO_LARGE => {
+                        warning = Some("单个CRD超过8MiB读取上限，目录不完整".into());
+                        break;
+                    }
                     Ok(Err(error)) => return Err(error),
                     Ok(Ok(value)) => value,
                 };
-                bytes += size;
-                let (items, next) = list_parts(&value, 200)?;
+                let (items, next) = list_parts(&value, page_size as usize)?;
                 for item in items {
                     if count >= 200 {
                         warning = Some("CRD数量达到200上限，目录不完整".into());

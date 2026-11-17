@@ -454,3 +454,66 @@ fn invalid_minio_endpoint_and_material_are_rejected_without_saving() {
     );
     assert!(repo.list().unwrap().profiles.is_empty());
 }
+
+#[test]
+fn nacos_credentials_stay_private_and_auth_target_edits_require_replacement() {
+    let (root, _, credentials, repo) = fixture();
+    let mut value = serde_json::json!({"driver":"nacos","endpoint":"https://registry.example.test/nacos","authentication":"password","namespace":"team-a"});
+    let settings: ProfileSettings = serde_json::from_value(value.clone()).expect("Nacos supported");
+    let material = br#"{"username":"synthetic-operator","password":"synthetic-nacos-only"}"#;
+    let saved = repo
+        .save(
+            ProfileDraft {
+                id: None,
+                expected_revision: None,
+                name: "registry".into(),
+                settings,
+            },
+            CredentialChange::Replace(material.to_vec()),
+        )
+        .unwrap()
+        .profile
+        .unwrap();
+    let disk = std::fs::read(root.0.join("profiles.json")).unwrap();
+    let public = serde_json::to_vec(&repo.list().unwrap()).unwrap();
+    for secret in ["synthetic-operator", "synthetic-nacos-only"] {
+        assert!(!String::from_utf8_lossy(&disk).contains(secret));
+        assert!(!String::from_utf8_lossy(&public).contains(secret));
+    }
+    let reloaded = ProfileStore::open(root.0.join("profiles.json"), credentials).unwrap();
+    assert!(
+        reloaded
+            .resolve(&saved.id, saved.revision)
+            .unwrap()
+            .secret
+            .unwrap()
+            == material
+    );
+    value["namespace"] = "team-b".into();
+    let updated = repo
+        .save(
+            ProfileDraft {
+                id: Some(saved.id),
+                expected_revision: Some(saved.revision),
+                name: "registry".into(),
+                settings: serde_json::from_value(value.clone()).unwrap(),
+            },
+            CredentialChange::Keep,
+        )
+        .unwrap()
+        .profile
+        .unwrap();
+    value["endpoint"] = "https://other.example.test/nacos".into();
+    assert!(
+        repo.save(
+            ProfileDraft {
+                id: Some(updated.id),
+                expected_revision: Some(updated.revision),
+                name: "moved".into(),
+                settings: serde_json::from_value(value).unwrap()
+            },
+            CredentialChange::Keep
+        )
+        .is_err()
+    );
+}
